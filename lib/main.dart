@@ -850,7 +850,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Row(
-          mainAxisAlignment: MainAxisAlignment.between,
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             Text(name, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: accentColor)),
             Text('IP: $ip', style: const TextStyle(fontSize: 12, color: Colors.grey)),
@@ -871,7 +871,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Row(
-                  mainAxisAlignment: MainAxisAlignment.between,
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Row(
                       children: [
@@ -893,7 +893,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 ),
                 const SizedBox(height: 8),
                 Row(
-                  mainAxisAlignment: MainAxisAlignment.between,
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Text('Tipo: ${quality.linkType}', style: const TextStyle(fontSize: 11, color: Colors.grey)),
                     Text('Latencia: ${quality.latencyMs} ms', style: const TextStyle(fontSize: 11, color: Colors.grey)),
