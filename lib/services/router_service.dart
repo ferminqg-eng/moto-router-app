@@ -33,6 +33,8 @@ class WifiConfigData {
   String key5;
   String enc5;
   bool separateBands;
+  int txPower; // dBm: 14, 17, 20, 23 (Max)
+  bool legacyMode; // Compatibilidad con clientes sin Wi-Fi 6 en 2.4 GHz
 
   WifiConfigData({
     this.ssid24 = '',
@@ -42,6 +44,8 @@ class WifiConfigData {
     this.key5 = '',
     this.enc5 = 'psk2',
     this.separateBands = false,
+    this.txPower = 23,
+    this.legacyMode = false,
   });
 }
 
@@ -51,6 +55,24 @@ class DhcpConfigData {
   String dns;
 
   DhcpConfigData({this.start = 100, this.limit = 150, this.dns = '1.1.1.1,1.0.0.1'});
+}
+
+class SatelliteQuality {
+  final bool isOnline;
+  final double latencyMs;
+  final int signalDbm;
+  final int qualityPercent;
+  final String linkType; // 'Ethernet (Cable)' o 'Wi-Fi Mesh Backhaul'
+  final String statusText;
+
+  SatelliteQuality({
+    required this.isOnline,
+    required this.latencyMs,
+    required this.signalDbm,
+    required this.qualityPercent,
+    required this.linkType,
+    required this.statusText,
+  });
 }
 
 class RouterService {
@@ -143,22 +165,36 @@ class RouterService {
     return RouterStatus(ip: ip, model: model, uptimeSeconds: uptime, clients: clients);
   }
 
-  /// Lee la configuración Wi-Fi actual del router
+  /// Lee la configuración Wi-Fi actual del router, incluyendo potencia y cifrado
   static Future<WifiConfigData> getWifiConfig(String ip, String password) async {
-    const script = 'uci show wireless';
+    const script = '''
+      echo "===WIRELESS===" && uci show wireless
+      echo "===TXPOWER===" && uci -q get wireless.radio0.txpower || echo "23"
+      echo "===LEGACY===" && uci -q get wireless.radio0.legacy_mode || echo "0"
+    ''';
     final output = await executeSSH(ip, password, script);
 
     final config = WifiConfigData();
-    final lines = output.split('\n');
+    final parts = output.split('===');
 
+    String wirelessOutput = '';
+    for (int i = 1; i < parts.length; i += 2) {
+      final tag = parts[i].trim();
+      final val = i + 1 < parts.length ? parts[i + 1].trim() : '';
+      if (tag == 'WIRELESS') wirelessOutput = val;
+      if (tag == 'TXPOWER') config.txPower = int.tryParse(val) ?? 23;
+      if (tag == 'LEGACY') config.legacyMode = (val == '1');
+    }
+
+    final lines = wirelessOutput.split('\n');
     String? currentIface;
     Map<String, Map<String, String>> ifaces = {};
 
     for (var line in lines) {
       final trimmed = line.trim();
       if (trimmed.contains('=wifi-iface')) {
-        final parts = trimmed.split('=');
-        currentIface = parts[0].replaceAll('wireless.', '');
+        final eqParts = trimmed.split('=');
+        currentIface = eqParts[0].replaceAll('wireless.', '');
         ifaces[currentIface] = {};
       } else if (currentIface != null && trimmed.startsWith('wireless.$currentIface.')) {
         final eqIdx = trimmed.indexOf('=');
@@ -177,7 +213,7 @@ class RouterService {
       final key = entry['key'] ?? '';
       final enc = entry['encryption'] ?? 'psk2';
 
-      if (dev.contains('5') || dev.contains('1') || dev.toLowerCase().contains('wlan1')) {
+      if (dev.contains('5') || dev.contains('1') || dev.toLowerCase().contains('wlan1') || dev.contains('radio1')) {
         config.ssid5 = ssid;
         config.key5 = key;
         config.enc5 = enc;
@@ -204,10 +240,27 @@ class RouterService {
     return config;
   }
 
-  /// Aplica cambios Wi-Fi (bandas separadas o unificadas) con 802.11r Roaming
+  /// Aplica cambios Wi-Fi (bandas, cifrado, potencia de transmisión y modo legacy Wi-Fi 6)
   static Future<void> saveWifiConfig(String ip, String password, WifiConfigData cfg) async {
     final commands = <String>[];
 
+    // 1. Ajustar potencia de transmisión (Tx Power) en ambos radios (2.4 y 5 GHz)
+    commands.add("uci -q set wireless.radio0.txpower='${cfg.txPower}'");
+    commands.add("uci -q set wireless.radio1.txpower='${cfg.txPower}'");
+
+    // 2. Modo de compatibilidad para clientes sin Wi-Fi 6 (Desactivar 802.11ax en 2.4 GHz)
+    if (cfg.legacyMode) {
+      commands.add("uci -q set wireless.radio0.legacy_mode='1'");
+      commands.add("uci -q set wireless.radio0.hwmode='11g'");
+      commands.add("uci -q set wireless.radio0.htmode='HT40'");
+      commands.add("uci -q set wireless.radio0.ieee80211ax='0'");
+    } else {
+      commands.add("uci -q set wireless.radio0.legacy_mode='0'");
+      commands.add("uci -q delete wireless.radio0.ieee80211ax");
+      commands.add("uci -q set wireless.radio0.htmode='HE40'");
+    }
+
+    // 3. Configurar interfaces inalámbricas (SSID, Clave, Cifrado, Roaming 802.11r)
     if (cfg.separateBands) {
       // 2.4 GHz y 5 GHz independientes
       commands.add('''
@@ -245,6 +298,90 @@ class RouterService {
     commands.add('wifi reload 2>/dev/null || wifi 2>/dev/null || true');
 
     await executeSSH(ip, password, commands.join('\n'));
+  }
+
+  /// Mide la calidad de conexión entre el router principal y un satélite
+  static Future<SatelliteQuality> checkSatelliteQuality(String mainIp, String mainPassword, String satIp) async {
+    final script = '''
+      # Ping para latencia
+      ping -c 3 -W 1 $satIp 2>/dev/null || echo "PING_FAIL"
+      echo "===ARP===" && cat /proc/net/arp | grep -w '$satIp' || true
+      echo "===IW===" && (iw dev wlan0 station dump 2>/dev/null; iw dev wlan1 station dump 2>/dev/null) || true
+    ''';
+
+    final output = await executeSSH(mainIp, mainPassword, script);
+    if (output.contains('100% packet loss') || output.contains('PING_FAIL')) {
+      return SatelliteQuality(
+        isOnline: false,
+        latencyMs: 0,
+        signalDbm: -100,
+        qualityPercent: 0,
+        linkType: 'Desconectado',
+        statusText: 'El satélite no responde o está apagado',
+      );
+    }
+
+    // Extraer latencia de ping
+    double latency = 1.5;
+    final rttMatch = RegExp(r'avg = ([0-9.]+)|min/avg/max = [0-9.]+/([0-9.]+)/').firstMatch(output);
+    if (rttMatch != null) {
+      latency = double.tryParse(rttMatch.group(1) ?? rttMatch.group(2) ?? '1.5') ?? 1.5;
+    }
+
+    // Buscar señal Wi-Fi
+    int signal = -60;
+    bool isWireless = false;
+    final sigMatch = RegExp(r'signal:\s*(-[0-9]+)\s*dBm').firstMatch(output);
+    if (sigMatch != null) {
+      signal = int.tryParse(sigMatch.group(1) ?? '-60') ?? -60;
+      isWireless = true;
+    }
+
+    // Calcular calidad porcentual
+    int quality;
+    String status;
+    String linkType;
+
+    if (!isWireless && latency < 2.5) {
+      linkType = 'Ethernet por Cable (1 Gbps)';
+      quality = 100;
+      status = 'Excelente (Enlace gigabit por cable)';
+    } else {
+      linkType = 'Wi-Fi Mesh Backhaul';
+      if (signal >= -55) {
+        quality = 95;
+        status = 'Excelente (-${signal.abs()} dBm)';
+      } else if (signal >= -68) {
+        quality = 80;
+        status = 'Buena (-${signal.abs()} dBm)';
+      } else if (signal >= -78) {
+        quality = 55;
+        status = 'Regular (-${signal.abs()} dBm - Recomendado acercar)';
+      } else {
+        quality = 30;
+        status = 'Débil (-${signal.abs()} dBm - Muy lejos)';
+      }
+    }
+
+    return SatelliteQuality(
+      isOnline: true,
+      latencyMs: latency,
+      signalDbm: signal,
+      qualityPercent: quality,
+      linkType: linkType,
+      statusText: status,
+    );
+  }
+
+  /// Ajusta la potencia de transmisión (Tx Power) en un satélite específico
+  static Future<void> setSatelliteTxPower(String satIp, String satPassword, int txPower) async {
+    final script = '''
+      uci -q set wireless.radio0.txpower='$txPower'
+      uci -q set wireless.radio1.txpower='$txPower'
+      uci commit wireless
+      wifi reload 2>/dev/null || wifi 2>/dev/null || true
+    ''';
+    await executeSSH(satIp, satPassword, script);
   }
 
   /// Lee configuración actual de DHCP y DNS
@@ -326,6 +463,7 @@ class RouterService {
     required String ssid,
     required String key,
     String encryption = 'psk2',
+    int txPower = 23,
   }) async {
     final script = '''
       uci set network.lan.ipaddr='$targetIp'
@@ -338,6 +476,9 @@ class RouterService {
       uci commit dhcp
       /etc/init.d/dnsmasq stop 2>/dev/null
       /etc/init.d/dnsmasq disable 2>/dev/null
+
+      uci -q set wireless.radio0.txpower='$txPower'
+      uci -q set wireless.radio1.txpower='$txPower'
 
       for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
         uci set wireless.\${iface}.ssid='$ssid'
