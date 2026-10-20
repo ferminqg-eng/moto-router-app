@@ -49,8 +49,14 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   bool _separateBands = false;
   final TextEditingController _ssid24Controller = TextEditingController();
   final TextEditingController _key24Controller = TextEditingController();
+  String _enc24 = 'psk2';
+
   final TextEditingController _ssid5Controller = TextEditingController();
   final TextEditingController _key5Controller = TextEditingController();
+  String _enc5 = 'psk2';
+
+  int _txPower = 23; // 23 = Max (100%), 20 = Alta (75%), 17 = Media (50%), 14 = Baja (25%)
+  bool _legacyMode = false; // Compatibilidad con dispositivos sin Wi-Fi 6
 
   // DHCP State
   final TextEditingController _dhcpStartController = TextEditingController(text: '100');
@@ -64,9 +70,16 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   final TextEditingController _pfIntPortController = TextEditingController();
   String _pfProto = 'tcp udp';
 
-  // Mesh Satellites
+  // Mesh Satellites State
   final TextEditingController _sat2PassController = TextEditingController();
+  int _sat2TxPower = 23;
+  SatelliteQuality? _sat2Quality;
+  bool _checkingSat2 = false;
+
   final TextEditingController _sat3PassController = TextEditingController();
+  int _sat3TxPower = 23;
+  SatelliteQuality? _sat3Quality;
+  bool _checkingSat3 = false;
 
   void _showSnack(String msg, {bool isError = false}) {
     ScaffoldMessenger.of(context).showSnackBar(
@@ -78,7 +91,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     );
   }
 
-  // 1. Desbloqueo y Login automático integrado
+  // Login y desbloqueo automático
   Future<void> _login() async {
     final ip = _ipController.text.trim();
     final pass = _passController.text.trim();
@@ -102,7 +115,6 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         _status = status;
       });
 
-      // Cargar configuraciones actuales
       _loadWifiConfig();
       _loadDhcpConfig();
       _showSnack('¡Conexión establecida con éxito!');
@@ -120,8 +132,14 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         _separateBands = wifi.separateBands;
         _ssid24Controller.text = wifi.ssid24;
         _key24Controller.text = wifi.key24;
+        _enc24 = wifi.enc24;
+
         _ssid5Controller.text = wifi.ssid5;
         _key5Controller.text = wifi.key5;
+        _enc5 = wifi.enc5;
+
+        _txPower = wifi.txPower;
+        _legacyMode = wifi.legacyMode;
       });
     } catch (_) {}
   }
@@ -144,12 +162,16 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         separateBands: _separateBands,
         ssid24: _ssid24Controller.text.trim(),
         key24: _key24Controller.text.trim(),
+        enc24: _enc24,
         ssid5: _separateBands ? _ssid5Controller.text.trim() : _ssid24Controller.text.trim(),
         key5: _separateBands ? _key5Controller.text.trim() : _key24Controller.text.trim(),
+        enc5: _separateBands ? _enc5 : _enc24,
+        txPower: _txPower,
+        legacyMode: _legacyMode,
       );
 
       await RouterService.saveWifiConfig(_currentIp, _currentPassword, cfg);
-      _showSnack('Wi-Fi y Roaming 802.11r actualizados correctamente');
+      _showSnack('Wi-Fi, Cifrado y Potencia actualizados correctamente');
     } catch (e) {
       _showSnack('Error al guardar Wi-Fi: $e', isError: true);
     } finally {
@@ -205,7 +227,48 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     }
   }
 
-  Future<void> _setupSatellite(String targetIp, String satPassword) async {
+  // Comprobar calidad de satélite
+  Future<void> _checkQuality(String satIp, bool isSat2) async {
+    setState(() {
+      if (isSat2) _checkingSat2 = true;
+      else _checkingSat3 = true;
+    });
+
+    try {
+      final q = await RouterService.checkSatelliteQuality(_currentIp, _currentPassword, satIp);
+      setState(() {
+        if (isSat2) _sat2Quality = q;
+        else _sat3Quality = q;
+      });
+      _showSnack('Diagnóstico completado para $satIp: ${q.statusText}');
+    } catch (e) {
+      _showSnack('Error midiendo calidad: $e', isError: true);
+    } finally {
+      setState(() {
+        if (isSat2) _checkingSat2 = false;
+        else _checkingSat3 = false;
+      });
+    }
+  }
+
+  // Ajustar potencia satélite
+  Future<void> _applySatellitePower(String satIp, String satPassword, int txPower) async {
+    if (satPassword.isEmpty) {
+      return _showSnack('Ingresa la contraseña del satélite primero', isError: true);
+    }
+
+    setState(() => _isLoading = true);
+    try {
+      await RouterService.setSatelliteTxPower(satIp, satPassword, txPower);
+      _showSnack('Potencia de transmisión ($txPower dBm) aplicada en $satIp');
+    } catch (e) {
+      _showSnack('Error aplicando potencia: $e', isError: true);
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _setupSatellite(String targetIp, String satPassword, int txPower) async {
     if (satPassword.isEmpty) {
       return _showSnack('Ingresa la clave del satélite', isError: true);
     }
@@ -223,6 +286,8 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         mainGateway: _currentIp,
         ssid: _ssid24Controller.text.trim(),
         key: _key24Controller.text.trim(),
+        encryption: _enc24,
+        txPower: txPower,
       );
       _showSnack('¡Satélite $targetIp emparejado al Mesh!');
     } catch (e) {
@@ -415,7 +480,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               children: [
                 const Text('Configurar Red Wi-Fi', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white)),
                 const SizedBox(height: 4),
-                const Text('Modifica el nombre y clave de tus antenas con Roaming 802.11r activo', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                const Text('Nombre, clave, cifrado y potencia de señal con Roaming 802.11r activo', style: TextStyle(fontSize: 12, color: Colors.grey)),
                 const SizedBox(height: 14),
 
                 SwitchListTile(
@@ -430,7 +495,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 ),
                 const Divider(height: 20),
 
-                // Banda 2.4 GHz (o Red Principal si unificado)
+                // Banda 2.4 GHz (o Principal)
                 Text(
                   _separateBands ? 'Banda 2.4 GHz' : 'Red Wi-Fi Principal (2.4 & 5 GHz)',
                   style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF3B82F6)),
@@ -448,9 +513,25 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   style: const TextStyle(color: Colors.white),
                   decoration: const InputDecoration(labelText: 'Contraseña Wi-Fi', border: OutlineInputBorder()),
                 ),
+                const SizedBox(height: 10),
+                DropdownButtonFormField<String>(
+                  value: _enc24,
+                  dropdownColor: const Color(0xFF1E293B),
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  decoration: const InputDecoration(labelText: 'Tipo de Cifrado (Seguridad)', border: OutlineInputBorder()),
+                  items: const [
+                    DropdownMenuItem(value: 'psk2', child: Text('WPA2-PSK (Recomendado para máxima compatibilidad)')),
+                    DropdownMenuItem(value: 'sae-mixed', child: Text('WPA2 / WPA3 Personal (Mixto)')),
+                    DropdownMenuItem(value: 'sae', child: Text('WPA3-SAE (Estricto)')),
+                    DropdownMenuItem(value: 'psk-mixed', child: Text('WPA / WPA2 (Dispositivos muy antiguos)')),
+                  ],
+                  onChanged: (v) {
+                    if (v != null) setState(() => _enc24 = v);
+                  },
+                ),
 
                 if (_separateBands) ...[
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 18),
                   const Text('Banda 5 GHz (Alta Velocidad)', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.indigoAccent)),
                   const SizedBox(height: 8),
                   TextField(
@@ -465,9 +546,61 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     style: const TextStyle(color: Colors.white),
                     decoration: const InputDecoration(labelText: 'Contraseña 5 GHz', border: OutlineInputBorder()),
                   ),
+                  const SizedBox(height: 10),
+                  DropdownButtonFormField<String>(
+                    value: _enc5,
+                    dropdownColor: const Color(0xFF1E293B),
+                    style: const TextStyle(color: Colors.white, fontSize: 13),
+                    decoration: const InputDecoration(labelText: 'Cifrado 5 GHz', border: OutlineInputBorder()),
+                    items: const [
+                      DropdownMenuItem(value: 'psk2', child: Text('WPA2-PSK (Compatible)')),
+                      DropdownMenuItem(value: 'sae-mixed', child: Text('WPA2 / WPA3 Mixto')),
+                      DropdownMenuItem(value: 'sae', child: Text('WPA3-SAE')),
+                    ],
+                    onChanged: (v) {
+                      if (v != null) setState(() => _enc5 = v);
+                    },
+                  ),
                 ],
 
-                const SizedBox(height: 20),
+                const Divider(height: 28),
+
+                // Control de Potencia de Transmisión (Tx Power)
+                const Text('Potencia de Señal / Cobertura (Tx Power)', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orangeAccent)),
+                const SizedBox(height: 4),
+                const Text('Aumenta el alcance de las antenas para cubrir habitaciones lejanas', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<int>(
+                  value: _txPower,
+                  dropdownColor: const Color(0xFF1E293B),
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  decoration: const InputDecoration(labelText: 'Nivel de Potencia', border: OutlineInputBorder()),
+                  items: const [
+                    DropdownMenuItem(value: 23, child: Text('⚡ 23 dBm (100% - Máxima Potencia y Cobertura)')),
+                    DropdownMenuItem(value: 20, child: Text('🟢 20 dBm (75% - Alta)')),
+                    DropdownMenuItem(value: 17, child: Text('🟡 17 dBm (50% - Media / Espacios pequeños)')),
+                    DropdownMenuItem(value: 14, child: Text('🔵 14 dBm (25% - Baja / Ahorro energético)')),
+                  ],
+                  onChanged: (v) {
+                    if (v != null) setState(() => _txPower = v);
+                  },
+                ),
+
+                const SizedBox(height: 16),
+
+                // Switch Modo Compatibilidad Wi-Fi 6
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Modo Compatibilidad IoT / Dispositivos Antiguos', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white)),
+                  subtitle: const Text(
+                    'Desactiva 802.11ax en 2.4 GHz para que bombillos inteligentes, enchufes y celulares viejos se conecten sin fallos',
+                    style: TextStyle(fontSize: 11, color: Colors.grey),
+                  ),
+                  value: _legacyMode,
+                  onChanged: (val) => setState(() => _legacyMode = val),
+                ),
+
+                const SizedBox(height: 22),
                 ElevatedButton(
                   onPressed: _isLoading ? null : _saveWifi,
                   style: ElevatedButton.styleFrom(
@@ -476,7 +609,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   ),
-                  child: const Text('Guardar y Aplicar Wi-Fi', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+                  child: const Text('Guardar y Aplicar Configuración Wi-Fi', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
                 ),
               ],
             ),
@@ -656,52 +789,194 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 const Text('Asistente Mesh Tripack', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white)),
                 const SizedBox(height: 6),
                 const Text(
-                  'Sincroniza tus nodos satélites 2 y 3. La app apagará su DHCP para evitar colisiones y replicará el Wi-Fi con Roaming 802.11r.',
+                  'Supervisa la calidad de enlace entre nodos y ajusta la potencia de transmisión de cada satélite.',
                   style: TextStyle(fontSize: 12, color: Colors.grey),
                 ),
                 const Divider(height: 24),
-                const Text('Nodo Satélite 2 (IP: 192.168.1.2)', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF3B82F6))),
-                const SizedBox(height: 6),
-                TextField(
-                  controller: _sat2PassController,
-                  obscureText: true,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: const InputDecoration(labelText: 'Clave etiqueta Satélite 2', border: OutlineInputBorder()),
+
+                // NODO SATELITE 2
+                _buildSatelliteCard(
+                  name: 'Nodo Satélite 2',
+                  ip: '192.168.1.2',
+                  passController: _sat2PassController,
+                  quality: _sat2Quality,
+                  checking: _checkingSat2,
+                  txPower: _sat2TxPower,
+                  onCheckQuality: () => _checkQuality('192.168.1.2', true),
+                  onPowerChanged: (p) => setState(() => _sat2TxPower = p),
+                  onApplyPower: () => _applySatellitePower('192.168.1.2', _sat2PassController.text.trim(), _sat2TxPower),
+                  onSync: () => _setupSatellite('192.168.1.2', _sat2PassController.text.trim(), _sat2TxPower),
+                  accentColor: const Color(0xFF3B82F6),
                 ),
-                const SizedBox(height: 10),
-                ElevatedButton(
-                  onPressed: () => _setupSatellite('192.168.1.2', _sat2PassController.text.trim()),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF2563EB),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                  ),
-                  child: const Text('Sincronizar Satélite 2', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
-                ),
-                const Divider(height: 24),
-                const Text('Nodo Satélite 3 (IP: 192.168.1.3)', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.indigoAccent)),
-                const SizedBox(height: 6),
-                TextField(
-                  controller: _sat3PassController,
-                  obscureText: true,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: const InputDecoration(labelText: 'Clave etiqueta Satélite 3', border: OutlineInputBorder()),
-                ),
-                const SizedBox(height: 10),
-                ElevatedButton(
-                  onPressed: () => _setupSatellite('192.168.1.3', _sat3PassController.text.trim()),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF4F46E5),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                  ),
-                  child: const Text('Sincronizar Satélite 3', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+
+                const Divider(height: 28),
+
+                // NODO SATELITE 3
+                _buildSatelliteCard(
+                  name: 'Nodo Satélite 3',
+                  ip: '192.168.1.3',
+                  passController: _sat3PassController,
+                  quality: _sat3Quality,
+                  checking: _checkingSat3,
+                  txPower: _sat3TxPower,
+                  onCheckQuality: () => _checkQuality('192.168.1.3', false),
+                  onPowerChanged: (p) => setState(() => _sat3TxPower = p),
+                  onApplyPower: () => _applySatellitePower('192.168.1.3', _sat3PassController.text.trim(), _sat3TxPower),
+                  onSync: () => _setupSatellite('192.168.1.3', _sat3PassController.text.trim(), _sat3TxPower),
+                  accentColor: const Color(0xFF6366F1),
                 ),
               ],
             ),
           ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSatelliteCard({
+    required String name,
+    required String ip,
+    required TextEditingController passController,
+    required SatelliteQuality? quality,
+    required bool checking,
+    required int txPower,
+    required VoidCallback onCheckQuality,
+    required ValueChanged<int> onPowerChanged,
+    required VoidCallback onApplyPower,
+    required VoidCallback onSync,
+    required Color accentColor,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.between,
+          children: [
+            Text(name, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: accentColor)),
+            Text('IP: $ip', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+          ],
+        ),
+        const SizedBox(height: 8),
+
+        // Tarjeta de calidad de enlace
+        if (quality != null) ...[
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0F172A),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: quality.isOnline ? Colors.green.withOpacity(0.4) : Colors.red.withOpacity(0.4)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.between,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(quality.isOnline ? Icons.wifi : Icons.wifi_off, color: quality.isOnline ? Colors.greenAccent : Colors.redAccent, size: 18),
+                        const SizedBox(width: 6),
+                        Text(quality.statusText, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white)),
+                      ],
+                    ),
+                    Text('${quality.qualityPercent}%', style: TextStyle(fontWeight: FontWeight.bold, color: quality.isOnline ? Colors.greenAccent : Colors.redAccent)),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                LinearProgressIndicator(
+                  value: quality.qualityPercent / 100,
+                  backgroundColor: Colors.grey[800],
+                  valueColor: AlwaysStoppedAnimation<Color>(
+                    quality.qualityPercent > 70 ? Colors.greenAccent : (quality.qualityPercent > 40 ? Colors.amberAccent : Colors.redAccent),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.between,
+                  children: [
+                    Text('Tipo: ${quality.linkType}', style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                    Text('Latencia: ${quality.latencyMs} ms', style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+        ],
+
+        // Botón Diagnosticar Calidad
+        OutlinedButton.icon(
+          onPressed: checking ? null : onCheckQuality,
+          icon: checking
+              ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+              : const Icon(Icons.speed, size: 16),
+          label: Text(checking ? 'Midiendo señal...' : 'Ver Calidad de Conexión', style: const TextStyle(fontSize: 13, color: Colors.white)),
+          style: OutlinedButton.styleFrom(
+            side: BorderSide(color: accentColor),
+            padding: const EdgeInsets.symmetric(vertical: 10),
+          ),
+        ),
+
+        const SizedBox(height: 12),
+
+        // Potencia individual para este satélite
+        Row(
+          children: [
+            Expanded(
+              flex: 2,
+              child: DropdownButtonFormField<int>(
+                value: txPower,
+                dropdownColor: const Color(0xFF1E293B),
+                style: const TextStyle(color: Colors.white, fontSize: 12),
+                decoration: const InputDecoration(labelText: 'Potencia Satélite', border: OutlineInputBorder(), isDense: true),
+                items: const [
+                  DropdownMenuItem(value: 23, child: Text('⚡ 23 dBm (Máx / 100%)')),
+                  DropdownMenuItem(value: 20, child: Text('🟢 20 dBm (Alta / 75%)')),
+                  DropdownMenuItem(value: 17, child: Text('🟡 17 dBm (Media / 50%)')),
+                  DropdownMenuItem(value: 14, child: Text('🔵 14 dBm (Baja / 25%)')),
+                ],
+                onChanged: (v) {
+                  if (v != null) onPowerChanged(v);
+                },
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              flex: 1,
+              child: ElevatedButton(
+                onPressed: onApplyPower,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF334155),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+                child: const Text('Aplicar', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
+              ),
+            ),
+          ],
+        ),
+
+        const SizedBox(height: 12),
+
+        // Clave etiqueta y Sincronizar
+        TextField(
+          controller: passController,
+          obscureText: true,
+          style: const TextStyle(color: Colors.white),
+          decoration: InputDecoration(labelText: 'Clave etiqueta $name', border: const OutlineInputBorder(), isDense: true),
+        ),
+        const SizedBox(height: 8),
+        ElevatedButton(
+          onPressed: onSync,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: accentColor,
+            foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+          child: Text('Sincronizar a la Malla Mesh', style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
         ),
       ],
     );
