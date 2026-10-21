@@ -339,10 +339,8 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       _showSnack('Paso 2/3: Sincronizando Wi-Fi y configurando red mesh...');
       final ssid = _ssid24Controller.text.trim().isNotEmpty
           ? _ssid24Controller.text.trim()
-          : (_wifiConfig?.ssid24 ?? 'MotoWiFi');
-      final key = _key24Controller.text.trim().isNotEmpty
-          ? _key24Controller.text.trim()
-          : (_wifiConfig?.key24 ?? '');
+          : 'LanRouterWiFi';
+      final key = _key24Controller.text.trim();
 
       await RouterService.configureMeshSatellite(
         satIp: currentIp,
@@ -580,7 +578,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     );
                     if (confirm == true) {
                       try {
-                        await RouterService.executeSSH(_currentIp, _currentPass, 'reboot');
+                        await RouterService.executeSSH(_currentIp, _currentPassword, 'reboot');
                         if (mounted) {
                           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Reinicio enviado... Espera 90 segundos')));
                         }
@@ -624,7 +622,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     );
                     if (confirm == true) {
                       try {
-                        await RouterService.factoryReset(_currentIp, _currentPass);
+                        await RouterService.factoryReset(_currentIp, _currentPassword);
                         if (mounted) {
                           ScaffoldMessenger.of(context).showSnackBar(
                             const SnackBar(
