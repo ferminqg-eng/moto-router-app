@@ -1,4 +1,4 @@
-name: moto_router_manager
+name: lan_router_management
 description: "App Android para gestión local Lan Router Management"
 publish_to: 'none'
 version: 2.0.0+2
