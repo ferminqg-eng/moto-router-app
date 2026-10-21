@@ -1,7 +1,7 @@
 name: moto_router_manager
-description: "App Android para gestión local de routers Motorola con Minim y Mesh Tripack"
+description: "App Android para gestión local Lan Router Management"
 publish_to: 'none'
-version: 1.0.0+1
+version: 2.0.0+2
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
