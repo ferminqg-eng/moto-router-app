@@ -76,28 +76,77 @@ class SatelliteQuality {
 }
 
 class RouterService {
-  /// Desbloquea y arranca LuCI y SSH directamente desde la app mediante POST con contraseña
+  /// Desbloquea y arranca LuCI y SSH directamente desde la app mediante POST con contraseña,
+  /// preservando las cookies de sesión (sysauth / sysauth_https) y verificando el puerto 22
   static Future<bool> unlockRouter(String ip, String password) async {
     final client = HttpClient()
       ..badCertificateCallback = (X509Certificate cert, String host, int port) => true;
 
     try {
       final postData = 'luci_username=root&luci_password=${Uri.encodeQueryComponent(password)}';
-      final endpoints = [
-        'https://$ip/cgi-bin/luci/admin/minim/enable_admin',
-        'https://$ip/cgi-bin/luci/admin/minim/start_sshd',
-      ];
+      String sessionCookie = '';
 
-      for (var url in endpoints) {
+      // Paso 1: enable_admin para autenticar y obtener cookie de sesión
+      for (final proto in ['https', 'http']) {
         try {
-          final request = await client.postUrl(Uri.parse(url)).timeout(const Duration(seconds: 4));
+          final uri = Uri.parse('$proto://$ip/cgi-bin/luci/admin/minim/enable_admin');
+          final request = await client.postUrl(uri).timeout(const Duration(seconds: 4));
           request.headers.contentType = ContentType('application', 'x-www-form-urlencoded');
+          request.headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+          request.headers.set('Origin', '$proto://$ip');
+          request.headers.set('Referer', '$proto://$ip/cgi-bin/luci/admin/minim/enable_admin');
           request.headers.contentLength = utf8.encode(postData).length;
           request.write(postData);
           final response = await request.close();
+          
+          for (var cookie in response.cookies) {
+            sessionCookie += '${cookie.name}=${cookie.value}; ';
+          }
           await response.drain();
+          if (sessionCookie.isNotEmpty) break;
         } catch (_) {}
       }
+
+      // Paso 2: start_sshd enviando la cookie de sesión autenticada
+      for (final proto in ['https', 'http']) {
+        try {
+          final uri = Uri.parse('$proto://$ip/cgi-bin/luci/admin/minim/start_sshd');
+
+          final reqPost = await client.postUrl(uri).timeout(const Duration(seconds: 4));
+          reqPost.headers.contentType = ContentType('application', 'x-www-form-urlencoded');
+          reqPost.headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+          reqPost.headers.set('Origin', '$proto://$ip');
+          reqPost.headers.set('Referer', '$proto://$ip/cgi-bin/luci/admin/minim/enable_admin');
+          if (sessionCookie.isNotEmpty) {
+            reqPost.headers.set(HttpHeaders.cookieHeader, sessionCookie);
+          }
+          reqPost.headers.contentLength = utf8.encode(postData).length;
+          reqPost.write(postData);
+          final resPost = await reqPost.close();
+          await resPost.drain();
+
+          final reqGet = await client.getUrl(uri).timeout(const Duration(seconds: 4));
+          reqGet.headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+          reqGet.headers.set('Referer', '$proto://$ip/cgi-bin/luci/admin/minim/enable_admin');
+          if (sessionCookie.isNotEmpty) {
+            reqGet.headers.set(HttpHeaders.cookieHeader, sessionCookie);
+          }
+          final resGet = await reqGet.close();
+          await resGet.drain();
+        } catch (_) {}
+      }
+
+      // Paso 3: Esperar hasta 8 segundos a que SSH (puerto 22) esté abierto
+      for (int i = 0; i < 16; i++) {
+        try {
+          final s = await Socket.connect(ip, 22, timeout: const Duration(milliseconds: 500));
+          s.destroy();
+          return true; // SSH listo!
+        } catch (_) {
+          await Future.delayed(const Duration(milliseconds: 500));
+        }
+      }
+
       return true;
     } finally {
       client.close();
@@ -127,6 +176,7 @@ class RouterService {
     const script = '''
       echo "===UPTIME===" && cat /proc/uptime
       echo "===LEASES===" && cat /tmp/dhcp.leases 2>/dev/null || cat /var/dhcp.leases 2>/dev/null
+      echo "===ARP===" && cat /proc/net/arp 2>/dev/null
       echo "===MODEL===" && cat /tmp/sysinfo/model 2>/dev/null || cat /proc/cpuinfo | grep -m1 'model name'
     ''';
 
@@ -157,6 +207,23 @@ class RouterService {
               ip: cols[2],
               name: cols[3] == '*' ? 'Dispositivo' : cols[3],
             ));
+          }
+        }
+      } else if (tag == 'ARP') {
+        final lines = content.split('\n');
+        for (var line in lines) {
+          final cols = line.trim().split(RegExp(r'\s+'));
+          // IP address HW type Flags HW address Mask Device
+          if (cols.length >= 4 && cols[0].contains('.') && cols[3].contains(':') && cols[3] != '00:00:00:00:00:00') {
+            final arpIp = cols[0];
+            final arpMac = cols[3];
+            if (!clients.any((c) => c.ip == arpIp || c.mac.toLowerCase() == arpMac.toLowerCase())) {
+              clients.add(ConnectedClient(
+                mac: arpMac,
+                ip: arpIp,
+                name: 'Dispositivo Red',
+              ));
+            }
           }
         }
       }
@@ -487,6 +554,8 @@ class RouterService {
         uci set wireless.\${iface}.disabled='0'
         uci set wireless.\${iface}.ieee80211r='1'
         uci set wireless.\${iface}.mobility_domain='4f54'
+        uci set wireless.\${iface}.ft_over_ds='0'
+        uci set wireless.\${iface}.ft_psk_generate_local='1'
       done
       uci commit wireless
 
@@ -496,5 +565,30 @@ class RouterService {
       /etc/init.d/network restart &
     ''';
     await executeSSH(satIp, satPassword, script);
+  }
+
+  /// Activa Roaming 802.11r (Fast Transition) en el router principal
+  static Future<void> enableMeshRoamingOnMain(String ip, String password) async {
+    const script = '''
+      for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
+        uci set wireless.\${iface}.ieee80211r='1'
+        uci set wireless.\${iface}.mobility_domain='4f54'
+        uci set wireless.\${iface}.ft_over_ds='0'
+        uci set wireless.\${iface}.ft_psk_generate_local='1'
+      done
+      uci commit wireless
+    ''';
+    try {
+      await executeSSH(ip, password, script);
+    } catch (_) {}
+  }
+
+  /// Restablece el equipo a los valores de fábrica predeterminados (Reset Default)
+  static Future<void> factoryReset(String ip, String password) async {
+    const script = '''
+      (sleep 1; firstboot -y 2>/dev/null || jffs2reset -y 2>/dev/null; reboot -f) &
+      echo "FACTORY_RESET_INITIATED"
+    ''';
+    await executeSSH(ip, password, script);
   }
 }
