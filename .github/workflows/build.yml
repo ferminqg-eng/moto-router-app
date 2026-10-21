@@ -25,7 +25,7 @@ jobs:
 
       - name: Configurar Android
         run: |
-          flutter create --platforms=android --org com.lanrouter .
+          flutter create --platforms=android --org com.lanrouter --project-name lan_router_management .
 
       - name: Obtener dependencias
         run: flutter pub get
