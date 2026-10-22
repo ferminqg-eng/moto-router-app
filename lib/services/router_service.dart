@@ -39,6 +39,10 @@ class WifiConfigData {
   bool separateBands;
   int txPower; // dBm: 14, 17, 20, 23 (Max)
   bool legacyMode; // Compatibilidad con clientes sin Wi-Fi 6 en 2.4 GHz
+  int channel24;
+  int channel5;
+  String bssid24;
+  String bssid5;
 
   WifiConfigData({
     this.ssid24 = '',
@@ -50,6 +54,10 @@ class WifiConfigData {
     this.separateBands = false,
     this.txPower = 23,
     this.legacyMode = false,
+    this.channel24 = 6,
+    this.channel5 = 36,
+    this.bssid24 = '',
+    this.bssid5 = '',
   });
 }
 
@@ -344,12 +352,16 @@ class RouterService {
     } catch (_) {}
   }
 
-  /// Lee la configuración Wi-Fi actual del router, incluyendo potencia y cifrado
+  /// Lee la configuración Wi-Fi actual del router, incluyendo potencia, cifrado, canales y BSSID
   static Future<WifiConfigData> getWifiConfig(String ip, String password) async {
     const script = '''
       echo "===WIRELESS===" && uci show wireless
       echo "===TXPOWER===" && uci -q get wireless.radio0.txpower || echo "23"
       echo "===LEGACY===" && uci -q get wireless.radio0.legacy_mode || echo "0"
+      echo "===CHAN0===" && (wl -i wl0 channel 2>/dev/null || uci -q get wireless.radio0.channel || echo "6")
+      echo "===CHAN1===" && (wl -i wl1 channel 2>/dev/null || uci -q get wireless.radio1.channel || echo "36")
+      echo "===BSSID0===" && (wl -i wl0 cur_etheraddr 2>/dev/null || cat /sys/class/net/eth1/address 2>/dev/null || echo "")
+      echo "===BSSID1===" && (wl -i wl1 cur_etheraddr 2>/dev/null || cat /sys/class/net/eth2/address 2>/dev/null || echo "")
     ''';
     final output = await executeSSH(ip, password, script);
 
@@ -363,6 +375,16 @@ class RouterService {
       if (tag == 'WIRELESS') wirelessOutput = val;
       if (tag == 'TXPOWER') config.txPower = int.tryParse(val) ?? 23;
       if (tag == 'LEGACY') config.legacyMode = (val == '1');
+      if (tag == 'CHAN0') {
+        final match = RegExp(r'(\d+)').firstMatch(val);
+        if (match != null) config.channel24 = int.tryParse(match.group(1)!) ?? 6;
+      }
+      if (tag == 'CHAN1') {
+        final match = RegExp(r'(\d+)').firstMatch(val);
+        if (match != null) config.channel5 = int.tryParse(match.group(1)!) ?? 36;
+      }
+      if (tag == 'BSSID0') config.bssid24 = val.trim().toUpperCase();
+      if (tag == 'BSSID1') config.bssid5 = val.trim().toUpperCase();
     }
 
     final lines = wirelessOutput.split('\n');
@@ -420,7 +442,7 @@ class RouterService {
   }
 
   /// Aplica cambios Wi-Fi (bandas, cifrado, potencia de transmisión y modo legacy Wi-Fi 6)
-  /// Neutraliza unum, persiste en NVRAM, inyecta directamente al chip Broadcom wl y en UCI
+  /// Neutraliza unum, activa LazyWDS en router principal, persiste en NVRAM y en UCI
   static Future<void> saveWifiConfig(String ip, String password, WifiConfigData cfg) async {
     final commands = <String>[];
 
@@ -444,7 +466,7 @@ class RouterService {
     final key5 = cfg.separateBands ? cfg.key5 : cfg.key24;
     final enc5 = cfg.separateBands ? cfg.enc5 : cfg.enc24;
 
-    // 2. Persistir en NVRAM (Broadcom wl carga de aquí en boot)
+    // 2. Persistir en NVRAM (Broadcom wl carga de aquí en boot) y activar WDS
     commands.add('''
       if which nvram >/dev/null 2>&1; then
         ${ssid24.isNotEmpty ? "nvram set wl0_ssid='$ssid24'" : ""}
@@ -457,11 +479,15 @@ class RouterService {
         nvram set wl1_akm='psk2'
         nvram set wl0_txpwr='${cfg.txPower}'
         nvram set wl1_txpwr='${cfg.txPower}'
+        nvram set wl0_lazywds='1'
+        nvram set wl1_lazywds='1'
+        nvram set wl0_wds='1'
+        nvram set wl1_wds='1'
         nvram commit 2>/dev/null || true
       fi
     ''');
 
-    // 3. Inyección inmediata en caliente a los radios Broadcom wl
+    // 3. Inyección inmediata en caliente a los radios Broadcom wl con LazyWDS
     commands.add('''
       ${ssid24.isNotEmpty ? "wl -i wl0 ssid '$ssid24' 2>/dev/null || true" : ""}
       ${ssid5.isNotEmpty ? "wl -i wl1 ssid '$ssid5' 2>/dev/null || true" : ""}
@@ -469,11 +495,15 @@ class RouterService {
       ${key5.isNotEmpty ? "wl -i wl1 wpa_psk '$key5' 2>/dev/null || true" : ""}
       wl -i wl0 txpwr1 -d ${cfg.txPower} 2>/dev/null || true
       wl -i wl1 txpwr1 -d ${cfg.txPower} 2>/dev/null || true
+      wl -i wl0 lazywds 1 2>/dev/null || true
+      wl -i wl1 lazywds 1 2>/dev/null || true
     ''');
 
-    // 4. Ajustar potencia y modo legacy en OpenWrt UCI
+    // 4. Ajustar potencia, modo legacy y WDS en OpenWrt UCI
     commands.add("uci -q set wireless.radio0.txpower='${cfg.txPower}'");
     commands.add("uci -q set wireless.radio1.txpower='${cfg.txPower}'");
+    commands.add("uci -q set wireless.radio0.wds='1'");
+    commands.add("uci -q set wireless.radio1.wds='1'");
 
     if (cfg.legacyMode) {
       commands.add("uci -q set wireless.radio0.legacy_mode='1'");
@@ -501,6 +531,7 @@ class RouterService {
             uci set wireless.\${iface}.encryption='$enc24'
           fi
           uci set wireless.\${iface}.disabled='0'
+          uci set wireless.\${iface}.wds='1'
         done
       ''');
     } else {
@@ -510,9 +541,21 @@ class RouterService {
           ${key24.isNotEmpty ? "uci set wireless.\${iface}.key='$key24'" : ""}
           uci set wireless.\${iface}.encryption='$enc24'
           uci set wireless.\${iface}.disabled='0'
+          uci set wireless.\${iface}.wds='1'
         done
       ''');
     }
+
+    // 6. Commit y reinicio del subsistema wireless
+    commands.add('uci commit wireless');
+    commands.add('(wifi down 2>/dev/null; sleep 1; wifi up 2>/dev/null; /etc/init.d/network restart 2>/dev/null) &');
+
+    try {
+      await executeSSH(ip, password, commands.join('\n'));
+    } catch (_) {
+      // El reinicio de la interfaz de red cierra la sesión SSH normalmente
+    }
+  }
 
     // 6. Commit y reinicio del subsistema wireless
     commands.add('uci commit wireless');
@@ -941,7 +984,7 @@ class RouterService {
 
   /// Aprovisionamiento Guiado Inalámbrico del Satélite desde el teléfono
   /// (Conectado a la red de fábrica en 192.168.1.1)
-  /// Neutraliza unum, clona NVRAM, inyecta en wl con modo WET, unifica br-lan, fija IP y apaga DHCP
+  /// Alinea canales con router principal, activa WDS bidireccional, clona NVRAM y unifica br-lan
   static Future<void> provisionSatelliteDirect({
     required String satIp,
     required String satPassword,
@@ -950,6 +993,9 @@ class RouterService {
     required String mainSsid,
     required String mainKey,
     String satName = 'Equipo Satélite',
+    int channel5 = 36,
+    int channel24 = 6,
+    String mainBssid = '',
   }) async {
     // PASO 1: Desbloquear LuCI y arrancar Dropbear SSH en el satélite
     final unlocked = await unlockRouter(satIp, satPassword);
@@ -961,7 +1007,7 @@ class RouterService {
     final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
     final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
 
-    // PASO 2: Configuración híbrida completa (Switch + WET Backhaul + Hostname + Neutralizar Unum + NVRAM)
+    // PASO 2: Configuración Mesh WDS completa
     final script = '''
       # 1. Neutralizar completamente el agente de nube unum/minim
       /etc/init.d/unum stop 2>/dev/null || true
@@ -979,7 +1025,13 @@ class RouterService {
       echo '$cleanHost' > /proc/sys/kernel/hostname
       uci commit system
 
-      # 3. Persistir SSID y credenciales en NVRAM del satélite
+      # 3. Canales Wi-Fi: ALINEAR EXACTAMENTE CON EL ROUTER PRINCIPAL
+      uci -q set wireless.radio0.channel='$channel24'
+      uci -q set wireless.radio1.channel='$channel5'
+      uci -q set wireless.radio0.wds='1'
+      uci -q set wireless.radio1.wds='1'
+
+      # 4. Persistir en NVRAM del satélite y activar WDS
       if which nvram >/dev/null 2>&1; then
         nvram set router_name='$cleanHost'
         ${mainSsid.isNotEmpty ? "nvram set wl0_ssid='$mainSsid'" : ""}
@@ -990,22 +1042,34 @@ class RouterService {
         ${mainKey.isNotEmpty ? "nvram set wl_wpa_psk='$mainKey'" : ""}
         nvram set wl0_akm='psk2'
         nvram set wl1_akm='psk2'
+        nvram set wl0_channel='$channel24'
+        nvram set wl1_channel='$channel5'
+        nvram set wl0_lazywds='1'
+        nvram set wl1_lazywds='1'
+        nvram set wl0_wds='1'
+        nvram set wl1_wds='1'
+        ${mainBssid.isNotEmpty ? "nvram set wl1_wds='$mainBssid'" : ""}
         nvram commit 2>/dev/null || true
       fi
 
-      # 4. Inyección en caliente a los radios Broadcom del satélite
+      # 5. Inyección en caliente a los radios Broadcom del satélite
+      wl -i wl0 channel $channel24 2>/dev/null || true
+      wl -i wl1 channel $channel5 2>/dev/null || true
       ${mainSsid.isNotEmpty ? "wl -i wl0 ssid '$mainSsid' 2>/dev/null || true" : ""}
       ${mainSsid.isNotEmpty ? "wl -i wl1 ssid '$mainSsid' 2>/dev/null || true" : ""}
       ${mainKey.isNotEmpty ? "wl -i wl0 wpa_psk '$mainKey' 2>/dev/null || true" : ""}
       ${mainKey.isNotEmpty ? "wl -i wl1 wpa_psk '$mainKey' 2>/dev/null || true" : ""}
+      wl -i wl0 lazywds 1 2>/dev/null || true
+      wl -i wl1 lazywds 1 2>/dev/null || true
+      ${mainBssid.isNotEmpty ? "wl -i wl1 wds '$mainBssid' 2>/dev/null || true" : ""}
 
-      # 5. Unificar puertos WAN (eth1) y LAN (eth0) en br-lan (Modo Switch total transparente)
+      # 6. Unificar puertos WAN (eth1) y LAN (eth0) en br-lan (Modo Switch total transparente)
       uci -q delete network.wan
       uci -q delete network.wan6
       uci -q set network.lan.ifname='eth0 eth1'
       uci -q set network.lan.type='bridge'
 
-      # 6. Configurar IP fija final y Puerta de enlace al Router Principal
+      # 7. Configurar IP fija final y Puerta de enlace al Router Principal
       uci set network.lan.ipaddr='$targetIp'
       uci set network.lan.netmask='255.255.255.0'
       uci set network.lan.gateway='$mainGateway'
@@ -1013,42 +1077,45 @@ class RouterService {
       uci add_list network.lan.dns='$mainGateway'
       uci commit network
 
-      # 7. Apagar Servidor DHCP y dnsmasq para evitar conflictos de IP
+      # 8. Apagar Servidor DHCP y dnsmasq para evitar conflictos de IP
       uci set dhcp.lan.ignore='1'
       uci commit dhcp
       /etc/init.d/dnsmasq stop 2>/dev/null || true
       /etc/init.d/dnsmasq disable 2>/dev/null || true
 
-      # 8. Clonar emisión Wi-Fi en UCI
+      # 9. Clonar emisión Wi-Fi en UCI con WDS
       for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
         ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
         ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
         uci set wireless.\${iface}.encryption='psk2'
         uci set wireless.\${iface}.disabled='0'
+        uci set wireless.\${iface}.wds='1'
       done
-
-      # 9. Enlace Cliente Retorno Inalámbrico Mesh (Modo WET Broadcom para bridging L2 real)
-      ${(mainSsid.isNotEmpty && mainKey.isNotEmpty) ? """
       uci -q delete wireless.mesh_sta
-      uci set wireless.mesh_sta=wifi-iface
-      uci set wireless.mesh_sta.device='radio1'
-      uci set wireless.mesh_sta.mode='sta'
-      uci set wireless.mesh_sta.wet='1'
-      uci set wireless.mesh_sta.network='lan'
-      uci set wireless.mesh_sta.ssid='$mainSsid'
-      uci set wireless.mesh_sta.key='$mainKey'
-      uci set wireless.mesh_sta.encryption='psk2'
-      """ : ""}
       uci commit wireless
 
-      # 10. Activar WET directo en Broadcom wl1 (5GHz backhaul)
-      wl -i wl1 wet 1 2>/dev/null || true
-      ${mainSsid.isNotEmpty ? "wl -i wl1 join '$mainSsid' key '$mainKey' 2>/dev/null || true" : ""}
+      # 10. Script permanente de anexión automática WDS al bridge br-lan
+      mkdir -p /etc/hotplug.d/net
+      cat << 'EOF' > /etc/hotplug.d/net/99-wds-bridge
+      if echo "\$INTERFACE" | grep -qE "wds"; then
+        brctl addif br-lan "\$INTERFACE" 2>/dev/null || true
+      fi
+EOF
+
+      (brctl addif br-lan wds1.1 2>/dev/null || true)
+      (brctl addif br-lan wds0.1 2>/dev/null || true)
 
       # 11. Reinicio de red
       (/etc/init.d/network restart) &
       (sleep 2 && wifi down && sleep 1 && wifi up) &
     ''';
+
+    try {
+      await executeSSH(satIp, satPassword, script);
+    } catch (_) {
+      // El cambio de IP desconecta la sesión SSH normalmente
+    }
+  }
 
     try {
       await executeSSH(satIp, satPassword, script);
