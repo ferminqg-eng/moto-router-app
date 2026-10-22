@@ -721,46 +721,184 @@ class RouterService {
   /// Escaneo real del aire (RF Site Survey) para detectar nodos satélites cercanos y su señal
   static Future<List<WirelessScanResult>> scanWirelessAir(String ip, String password) async {
     const script = '''
-      (iwinfo wlan0 scan 2>/dev/null || iwinfo wlan1 scan 2>/dev/null || iw dev wlan0 scan 2>/dev/null || wl -i wl0 scan && sleep 1 && wl -i wl0 scanresults 2>/dev/null) || true
+      (wl -i wl0 scan 2>/dev/null && sleep 2 && wl -i wl0 scanresults 2>/dev/null) || \\
+      (wl -i wl1 scan 2>/dev/null && sleep 2 && wl -i wl1 scanresults 2>/dev/null) || \\
+      (iwinfo wlan0 scan 2>/dev/null) || \\
+      (iwinfo wlan1 scan 2>/dev/null) || \\
+      (iw dev wlan0 scan 2>/dev/null) || true
     ''';
     final output = await executeSSH(ip, password, script);
     final results = <WirelessScanResult>[];
 
-    final blocks = output.split(RegExp(r'(?:Cell \d+|BSS [0-9a-fA-F:]{17})'));
-    for (final block in blocks) {
-      if (block.trim().isEmpty) continue;
+    // Intentar formato Broadcom 'wl scanresults'
+    if (output.contains('BSSID:') || output.contains('SSID:')) {
+      final bssBlocks = output.split(RegExp(r'(?:BSSID:\s*|BSS\s+)', caseSensitive: false));
+      for (final block in bssBlocks) {
+        if (block.trim().isEmpty) continue;
+        final macMatch = RegExp(r'([0-9a-fA-F:]{17})').firstMatch(block);
+        final ssidMatch = RegExp(r'(?:SSID|ESSID):\s*["' + "'" + r']?([^"' + "'" + r'\n\r]+)["' + "'" + r']?', caseSensitive: false).firstMatch(block);
+        final signalMatch = RegExp(r'(?:RSSI|Signal|signal):\s*(-?\d+)\s*dBm', caseSensitive: false).firstMatch(block);
+        final chanMatch = RegExp(r'(?:Channel|channel):\s*(\d+)', caseSensitive: false).firstMatch(block);
+        final encMatch = RegExp(r'(?:RSN|WPA|Encryption):\s*([^\n\r]+)', caseSensitive: false).firstMatch(block);
 
-      final macMatch = RegExp(r'(?:Address:|BSS)\s*([0-9a-fA-F:]{17})', caseSensitive: false).firstMatch(block);
-      final ssidMatch = RegExp(r'(?:ESSID:|SSID:)\s*["' + "'" + r']?([^"' + "'" + r'\n\r]+)["' + "'" + r']?', caseSensitive: false).firstMatch(block);
-      final signalMatch = RegExp(r'(?:Signal:|signal:)\s*(-?\d+)\s*dBm', caseSensitive: false).firstMatch(block);
-      final chanMatch = RegExp(r'(?:Channel:|channel)\s*(\d+)', caseSensitive: false).firstMatch(block);
-      final encMatch = RegExp(r'(?:Encryption:|encryption:)\s*([^\n\r]+)', caseSensitive: false).firstMatch(block);
+        final mac = macMatch?.group(1)?.toUpperCase() ?? '';
+        String ssid = ssidMatch?.group(1)?.trim() ?? 'Red Oculta';
+        final signal = int.tryParse(signalMatch?.group(1) ?? '-75') ?? -75;
+        final channel = int.tryParse(chanMatch?.group(1) ?? '0') ?? 0;
+        final encryption = encMatch?.group(1)?.trim() ?? 'WPA2';
 
-      final mac = macMatch?.group(1)?.toUpperCase() ?? '';
-      String ssid = ssidMatch?.group(1)?.trim() ?? 'Red Oculta';
-      final signal = int.tryParse(signalMatch?.group(1) ?? '-80') ?? -80;
-      final channel = int.tryParse(chanMatch?.group(1) ?? '0') ?? 0;
-      final encryption = encMatch?.group(1)?.trim() ?? 'WPA2';
+        if (mac.isNotEmpty && mac != '00:00:00:00:00:00') {
+          final isMoto = ssid.toLowerCase().contains('moto') ||
+                         mac.startsWith('C8:C7:50') ||
+                         mac.startsWith('00:0C:E7') ||
+                         mac.startsWith('14:59:C0');
+          if (ssid == 'Red Oculta' && isMoto) ssid = 'Nodo Motorola Mesh';
+          if (!results.any((r) => r.mac == mac)) {
+            results.add(WirelessScanResult(
+              mac: mac,
+              ssid: ssid,
+              signal: signal,
+              channel: channel,
+              encryption: encryption,
+              isMotorola: isMoto,
+            ));
+          }
+        }
+      }
+    }
 
-      if (mac.isNotEmpty) {
-        final isMoto = ssid.toLowerCase().contains('moto') ||
-                       mac.startsWith('C8:C7:50') ||
-                       mac.startsWith('00:0C:E7') ||
-                       mac.startsWith('14:59:C0');
-        if (ssid == 'Red Oculta' && isMoto) ssid = 'Nodo Motorola Mesh';
-        results.add(WirelessScanResult(
-          mac: mac,
-          ssid: ssid,
-          signal: signal,
-          channel: channel,
-          encryption: encryption,
-          isMotorola: isMoto,
-        ));
+    if (results.isEmpty) {
+      final blocks = output.split(RegExp(r'(?:Cell \d+|BSS [0-9a-fA-F:]{17})'));
+      for (final block in blocks) {
+        if (block.trim().isEmpty) continue;
+
+        final macMatch = RegExp(r'(?:Address:|BSS)\s*([0-9a-fA-F:]{17})', caseSensitive: false).firstMatch(block);
+        final ssidMatch = RegExp(r'(?:ESSID:|SSID:)\s*["' + "'" + r']?([^"' + "'" + r'\n\r]+)["' + "'" + r']?', caseSensitive: false).firstMatch(block);
+        final signalMatch = RegExp(r'(?:Signal:|signal:)\s*(-?\d+)\s*dBm', caseSensitive: false).firstMatch(block);
+        final chanMatch = RegExp(r'(?:Channel:|channel)\s*(\d+)', caseSensitive: false).firstMatch(block);
+        final encMatch = RegExp(r'(?:Encryption:|encryption:)\s*([^\n\r]+)', caseSensitive: false).firstMatch(block);
+
+        final mac = macMatch?.group(1)?.toUpperCase() ?? '';
+        String ssid = ssidMatch?.group(1)?.trim() ?? 'Red Oculta';
+        final signal = int.tryParse(signalMatch?.group(1) ?? '-80') ?? -80;
+        final channel = int.tryParse(chanMatch?.group(1) ?? '0') ?? 0;
+        final encryption = encMatch?.group(1)?.trim() ?? 'WPA2';
+
+        if (mac.isNotEmpty) {
+          final isMoto = ssid.toLowerCase().contains('moto') ||
+                         mac.startsWith('C8:C7:50') ||
+                         mac.startsWith('00:0C:E7') ||
+                         mac.startsWith('14:59:C0');
+          if (ssid == 'Red Oculta' && isMoto) ssid = 'Nodo Motorola Mesh';
+          if (!results.any((r) => r.mac == mac)) {
+            results.add(WirelessScanResult(
+              mac: mac,
+              ssid: ssid,
+              signal: signal,
+              channel: channel,
+              encryption: encryption,
+              isMotorola: isMoto,
+            ));
+          }
+        }
       }
     }
 
     results.sort((a, b) => b.signal.compareTo(a.signal));
     return results;
+  }
+
+  /// Aprovisionamiento Guiado Directo del Satélite (Universal Bridge y Roaming 802.11r)
+  static Future<void> provisionSatelliteDirect({
+    required String satIp,
+    required String satPassword,
+    required String targetIp,
+    required String mainGateway,
+    required String mainSsid,
+    required String mainKey,
+    String connectionMode = 'cable',
+  }) async {
+    String script = '';
+
+    if (connectionMode == 'cable') {
+      script = '''
+        uci -q delete network.wan
+        uci -q delete network.wan6
+        uci -q set network.lan.ifname='eth0 eth1'
+        uci -q set network.lan.type='bridge'
+
+        uci set network.lan.ipaddr='$targetIp'
+        uci set network.lan.netmask='255.255.255.0'
+        uci set network.lan.gateway='$mainGateway'
+        uci -q delete network.lan.dns
+        uci add_list network.lan.dns='$mainGateway'
+        uci commit network
+
+        uci set dhcp.lan.ignore='1'
+        uci commit dhcp
+        /etc/init.d/dnsmasq stop 2>/dev/null || true
+        /etc/init.d/dnsmasq disable 2>/dev/null || true
+
+        for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
+          ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
+          ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
+          uci set wireless.\${iface}.encryption='psk2'
+          uci set wireless.\${iface}.disabled='0'
+          uci set wireless.\${iface}.ieee80211r='1'
+          uci set wireless.\${iface}.mobility_domain='4f54'
+          uci set wireless.\${iface}.ft_over_ds='0'
+          uci set wireless.\${iface}.ft_psk_generate_local='1'
+        done
+        uci commit wireless
+
+        /etc/init.d/minim stop 2>/dev/null || true
+        /etc/init.d/minim disable 2>/dev/null || true
+        /etc/init.d/network restart &
+        wifi reload 2>/dev/null || wifi 2>/dev/null || true
+      ''';
+    } else {
+      script = '''
+        uci set network.lan.ipaddr='$targetIp'
+        uci set network.lan.netmask='255.255.255.0'
+        uci set network.lan.gateway='$mainGateway'
+        uci -q delete network.lan.dns
+        uci add_list network.lan.dns='$mainGateway'
+        uci commit network
+
+        uci set dhcp.lan.ignore='1'
+        uci commit dhcp
+        /etc/init.d/dnsmasq stop 2>/dev/null || true
+        /etc/init.d/dnsmasq disable 2>/dev/null || true
+
+        for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
+          ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
+          ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
+          uci set wireless.\${iface}.encryption='psk2'
+          uci set wireless.\${iface}.disabled='0'
+          uci set wireless.\${iface}.ieee80211r='1'
+          uci set wireless.\${iface}.mobility_domain='4f54'
+        done
+
+        uci -q delete wireless.mesh_sta
+        uci set wireless.mesh_sta=wifi-iface
+        uci set wireless.mesh_sta.device='radio1'
+        uci set wireless.mesh_sta.mode='sta'
+        uci set wireless.mesh_sta.network='lan'
+        uci set wireless.mesh_sta.ssid='$mainSsid'
+        uci set wireless.mesh_sta.key='$mainKey'
+        uci set wireless.mesh_sta.encryption='psk2'
+        uci commit wireless
+
+        /etc/init.d/minim stop 2>/dev/null || true
+        /etc/init.d/minim disable 2>/dev/null || true
+        /etc/init.d/network restart &
+        wifi reload 2>/dev/null || wifi 2>/dev/null || true
+      ''';
+    }
+
+    try {
+      await executeSSH(satIp, satPassword, script);
+    } catch (_) {}
   }
 
   /// Restablece el equipo a los valores de fábrica predeterminados (Reset Default)
