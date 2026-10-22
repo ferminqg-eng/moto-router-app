@@ -220,6 +220,75 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     }
   }
 
+  // Diagnóstico en vivo de hardware Broadcom y Cloud Daemon
+  Future<void> _showDiagnosticDialog() async {
+    _showSnack('Consultando estado interno de hardware y NVRAM...');
+    try {
+      final diag = await RouterService.getDiagnosticInfo(_currentIp, _currentPassword);
+      if (!mounted) return;
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: const Color(0xFF1E293B),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Row(
+            children: [
+              Icon(Icons.analytics_outlined, color: Colors.amberAccent),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text('Diagnóstico de Hardware', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+              ),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _buildDiagRow('Agente Minim / Unum:', diag['UNUM'] ?? 'N/A',
+                    isOk: (diag['UNUM'] ?? '').contains('DETENIDO_OK')),
+                _buildDiagRow('NVRAM 2.4G SSID:', diag['NVRAM_SSID'] ?? 'N/A'),
+                _buildDiagRow('NVRAM 5G SSID:', diag['NVRAM_SSID5'] ?? 'N/A'),
+                _buildDiagRow('Broadcom wl0 (2.4G):', diag['WL0_SSID'] ?? 'N/A'),
+                _buildDiagRow('Broadcom wl1 (5G):', diag['WL1_SSID'] ?? 'N/A'),
+                _buildDiagRow('OpenWrt UCI SSID:', diag['UCI_SSID'] ?? 'N/A'),
+                _buildDiagRow('Hostname en Kernel:', diag['HOSTNAME'] ?? 'N/A'),
+              ],
+            ),
+          ),
+          actions: [
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2563EB)),
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cerrar'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      _showSnack('Error al obtener diagnóstico: $e', isError: true);
+    }
+  }
+
+  Widget _buildDiagRow(String title, String val, {bool? isOk}) {
+    Color color = Colors.white;
+    if (isOk != null) {
+      color = isOk ? const Color(0xFF34D399) : Colors.redAccent;
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: const TextStyle(fontSize: 11, color: Colors.grey, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 2),
+          Text(val, style: TextStyle(fontSize: 12, color: color, fontFamily: 'monospace')),
+          const Divider(color: Colors.white12, height: 10),
+        ],
+      ),
+    );
+  }
+
   // Guardar Wi-Fi
   Future<void> _saveWifi() async {
     setState(() => _isLoading = true);
@@ -632,6 +701,11 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         ),
         backgroundColor: const Color(0xFF1E293B),
         actions: [
+          IconButton(
+            tooltip: 'Diagnóstico de Hardware (NVRAM/Drivers)',
+            icon: const Icon(Icons.analytics_outlined, color: Colors.amberAccent),
+            onPressed: _showDiagnosticDialog,
+          ),
           IconButton(
             tooltip: 'Cerrar Sesión',
             icon: const Icon(Icons.logout, color: Colors.white70),
