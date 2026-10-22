@@ -59,7 +59,11 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   int _txPower = 23; // 23 = Max (100%), 20 = Alta (75%), 17 = Media (50%), 14 = Baja (25%)
   bool _legacyMode = false; // Compatibilidad con dispositivos sin Wi-Fi 6
 
-  // DHCP State
+  // Red LAN & DHCP State
+  bool _dhcpEnabled = true;
+  final TextEditingController _lanIpController = TextEditingController(text: '192.168.1.1');
+  final TextEditingController _lanNetmaskController = TextEditingController(text: '255.255.255.0');
+  final TextEditingController _lanGatewayController = TextEditingController();
   final TextEditingController _dhcpStartController = TextEditingController(text: '100');
   final TextEditingController _dhcpLimitController = TextEditingController(text: '150');
   String _selectedDns = '1.1.1.1,1.0.0.1';
@@ -177,9 +181,13 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     try {
       final dhcp = await RouterService.getDhcpConfig(_currentIp, _currentPassword);
       setState(() {
+        _dhcpEnabled = dhcp.dhcpEnabled;
         _dhcpStartController.text = dhcp.start.toString();
         _dhcpLimitController.text = dhcp.limit.toString();
         _selectedDns = dhcp.dns;
+        if (dhcp.lanIp.isNotEmpty) _lanIpController.text = dhcp.lanIp;
+        if (dhcp.netmask.isNotEmpty) _lanNetmaskController.text = dhcp.netmask;
+        _lanGatewayController.text = dhcp.gateway;
       });
     } catch (_) {}
   }
@@ -212,14 +220,263 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     setState(() => _isLoading = true);
     try {
       final cfg = DhcpConfigData(
+        dhcpEnabled: _dhcpEnabled,
         start: int.tryParse(_dhcpStartController.text.trim()) ?? 100,
         limit: int.tryParse(_dhcpLimitController.text.trim()) ?? 150,
         dns: _selectedDns,
       );
       await RouterService.saveDhcpConfig(_currentIp, _currentPassword, cfg);
-      _showSnack('Servidor DHCP y DNS actualizados');
+      _showSnack(_dhcpEnabled
+          ? 'Servidor DHCP activado y guardado correctamente'
+          : 'Servidor DHCP APAGADO (este satélite ya no causará colisiones en LAN a LAN)');
     } catch (e) {
       _showSnack('Error al guardar DHCP: $e', isError: true);
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _saveLanIp() async {
+    final newIp = _lanIpController.text.trim();
+    final netmask = _lanNetmaskController.text.trim();
+    final gateway = _lanGatewayController.text.trim();
+
+    if (newIp.isEmpty || netmask.isEmpty) {
+      return _showSnack('La IP y la máscara son obligatorias', isError: true);
+    }
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: const Text('¿Cambiar IP LAN del router?', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        content: Text(
+          'El router cambiará su IP local a $newIp y reiniciará su red.\n\n'
+          'Si cambias la IP, deberás reconectar la app a la nueva dirección: $newIp',
+          style: const TextStyle(color: Colors.white70, fontSize: 13),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2563EB)),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Confirmar Cambio'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    setState(() => _isLoading = true);
+    try {
+      await RouterService.saveLanIpConfig(
+        _currentIp,
+        _currentPassword,
+        newIp: newIp,
+        netmask: netmask,
+        gateway: gateway,
+        dns: gateway.isNotEmpty ? gateway : _selectedDns,
+      );
+
+      _showSnack('IP cambiada a $newIp. Reconectando...');
+      setState(() {
+        _currentIp = newIp;
+        _ipController.text = newIp;
+      });
+      await Future.delayed(const Duration(seconds: 4));
+      await _login();
+    } catch (e) {
+      _showSnack('IP guardada. Por favor conéctate a $newIp si se desconectó la sesión.');
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _applySatelliteApModeDialog() async {
+    final satIpCtrl = TextEditingController(text: '192.168.1.2');
+    final gwCtrl = TextEditingController(text: '192.168.1.1');
+    String selectedPreset = '192.168.1.2';
+
+    final proceed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1E293B),
+            title: const Row(
+              children: [
+                Icon(Icons.hub, color: Color(0xFF38BDF8)),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text('Modo Satélite / AP (Cable LAN a LAN)', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                ),
+              ],
+            ),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Prepara este equipo para operar como satélite interconectado por cable:\n\n'
+                    '1. Apaga el servidor DHCP (elimina choques de IP con el principal).\n'
+                    '2. Fija su IP en la misma subred (ej: 192.168.1.2 para Satélite 2, 192.168.1.3 para Satélite 3).\n'
+                    '3. Enlaza la puerta de enlace al router principal (192.168.1.1).\n\n'
+                    'Selecciona qué satélite estás configurando:',
+                    style: TextStyle(color: Colors.white70, fontSize: 12),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // Selector rápido de nodo satélite
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    children: [
+                      ChoiceChip(
+                        label: const Text('Satélite 2 (192.168.1.2)'),
+                        selected: selectedPreset == '192.168.1.2',
+                        selectedColor: const Color(0xFF0284C7),
+                        backgroundColor: const Color(0xFF0F172A),
+                        labelStyle: TextStyle(
+                          color: selectedPreset == '192.168.1.2' ? Colors.white : Colors.white70,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                        onSelected: (val) {
+                          if (val) {
+                            setDialogState(() {
+                              selectedPreset = '192.168.1.2';
+                              satIpCtrl.text = '192.168.1.2';
+                            });
+                          }
+                        },
+                      ),
+                      ChoiceChip(
+                        label: const Text('Satélite 3 (192.168.1.3)'),
+                        selected: selectedPreset == '192.168.1.3',
+                        selectedColor: const Color(0xFF6366F1),
+                        backgroundColor: const Color(0xFF0F172A),
+                        labelStyle: TextStyle(
+                          color: selectedPreset == '192.168.1.3' ? Colors.white : Colors.white70,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                        onSelected: (val) {
+                          if (val) {
+                            setDialogState(() {
+                              selectedPreset = '192.168.1.3';
+                              satIpCtrl.text = '192.168.1.3';
+                            });
+                          }
+                        },
+                      ),
+                      ChoiceChip(
+                        label: const Text('Satélite 4 (192.168.1.4)'),
+                        selected: selectedPreset == '192.168.1.4',
+                        selectedColor: const Color(0xFF0D9488),
+                        backgroundColor: const Color(0xFF0F172A),
+                        labelStyle: TextStyle(
+                          color: selectedPreset == '192.168.1.4' ? Colors.white : Colors.white70,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                        onSelected: (val) {
+                          if (val) {
+                            setDialogState(() {
+                              selectedPreset = '192.168.1.4';
+                              satIpCtrl.text = '192.168.1.4';
+                            });
+                          }
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+
+                  TextField(
+                    controller: satIpCtrl,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: const InputDecoration(
+                      labelText: 'IP Estática para este Satélite',
+                      hintText: '192.168.1.2',
+                      border: OutlineInputBorder(),
+                    ),
+                    onChanged: (val) {
+                      setDialogState(() {
+                        selectedPreset = val.trim();
+                      });
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: gwCtrl,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: const InputDecoration(
+                      labelText: 'IP del Router Principal (Gateway)',
+                      hintText: '192.168.1.1',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0284C7)),
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Aplicar y Apagar DHCP', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    if (proceed != true) return;
+
+    setState(() => _isLoading = true);
+    try {
+      final targetIp = satIpCtrl.text.trim();
+      final gateway = gwCtrl.text.trim();
+
+      _showSnack('Configurando satélite: apagando DHCP y fijando IP $targetIp...');
+      await RouterService.convertToAccessPoint(
+        _currentIp,
+        _currentPassword,
+        satIp: targetIp,
+        mainGateway: gateway,
+      );
+
+      _showSnack('¡Listo! Satélite configurado en $targetIp. Conecta el cable LAN a LAN.');
+      setState(() {
+        _currentIp = targetIp;
+        _ipController.text = targetIp;
+        _dhcpEnabled = false;
+        _lanIpController.text = targetIp;
+        _lanGatewayController.text = gateway;
+      });
+    } catch (e) {
+      _showSnack('Error al aplicar modo satélite: $e', isError: true);
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+        satIp: targetIp,
+        mainGateway: gateway,
+      );
+
+      _showSnack('¡Listo! Satélite configurado. Ya puedes conectar el cable LAN a LAN.');
+      setState(() {
+        _currentIp = targetIp;
+        _ipController.text = targetIp;
+        _dhcpEnabled = false;
+        _lanIpController.text = targetIp;
+        _lanGatewayController.text = gateway;
+      });
+    } catch (e) {
+      _showSnack('Error al aplicar modo satélite: $e', isError: true);
     } finally {
       setState(() => _isLoading = false);
     }
@@ -813,7 +1070,59 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        // Card DHCP y DNS
+        // 1. Card Asistente: Modo Satélite / AP (LAN a LAN sin colisión)
+        Card(
+          color: const Color(0xFF0F2B48),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: Color(0xFF0284C7), width: 1.5),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.lan, color: Color(0xFF38BDF8), size: 24),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Interconexión por Cable (LAN a LAN)',
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Si vas a conectar este satélite al router principal con cable de red, activa este modo. '
+                  'Apagará de inmediato el servidor DHCP y fijará su IP en 192.168.1.2 para que ambos equipos '
+                  'no colisionen en la misma red.',
+                  style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.35),
+                ),
+                const SizedBox(height: 14),
+                ElevatedButton.icon(
+                  onPressed: _isLoading ? null : _applySatelliteApModeDialog,
+                  icon: const Icon(Icons.flash_on, color: Colors.white),
+                  label: const Text(
+                    'Convertir en Satélite / Apagar DHCP',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF0284C7),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        const SizedBox(height: 16),
+
+        // 2. Card Dirección IP Local (LAN)
         Card(
           color: const Color(0xFF1E293B),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -822,30 +1131,145 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const Text('Servidor DHCP y DNS', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white)),
-                const SizedBox(height: 12),
+                const Row(
+                  children: [
+                    Icon(Icons.router, color: Color(0xFF60A5FA), size: 22),
+                    SizedBox(width: 8),
+                    Text('Dirección IP Local (LAN IP)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  'Establece la IP estática de este equipo. El router principal debe ser 192.168.1.1. Los satélites secundarios deben ser 192.168.1.2, 192.168.1.3, etc.',
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: _lanIpController,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: const InputDecoration(
+                    labelText: 'Dirección IP del Router',
+                    hintText: '192.168.1.1',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 10),
                 Row(
                   children: [
                     Expanded(
                       child: TextField(
-                        controller: _dhcpStartController,
-                        keyboardType: TextInputType.number,
+                        controller: _lanNetmaskController,
                         style: const TextStyle(color: Colors.white),
-                        decoration: const InputDecoration(labelText: 'IP Inicio', border: OutlineInputBorder()),
+                        decoration: const InputDecoration(
+                          labelText: 'Máscara de Red',
+                          hintText: '255.255.255.0',
+                          border: OutlineInputBorder(),
+                        ),
                       ),
                     ),
-                    const SizedBox(width: 12),
+                    const SizedBox(width: 10),
                     Expanded(
                       child: TextField(
-                        controller: _dhcpLimitController,
-                        keyboardType: TextInputType.number,
+                        controller: _lanGatewayController,
                         style: const TextStyle(color: Colors.white),
-                        decoration: const InputDecoration(labelText: 'Límite IPs', border: OutlineInputBorder()),
+                        decoration: const InputDecoration(
+                          labelText: 'Gateway (Router Principal)',
+                          hintText: '192.168.1.1',
+                          border: OutlineInputBorder(),
+                        ),
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 14),
+                ElevatedButton(
+                  onPressed: _isLoading ? null : _saveLanIp,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF2563EB),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                  child: const Text('Guardar IP Local (Reinicia Red)', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        const SizedBox(height: 16),
+
+        // 3. Card DHCP y DNS
+        Card(
+          color: const Color(0xFF1E293B),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text('Servidor DHCP y DNS', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: _dhcpEnabled ? const Color(0xFF065F46) : const Color(0xFF991B1B),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text(
+                        _dhcpEnabled ? 'ACTIVO' : 'APAGADO',
+                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Servidor DHCP Habilitado', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+                  subtitle: Text(
+                    _dhcpEnabled
+                        ? 'Asigna direcciones IP automáticamente a clientes (Router Principal).'
+                        : 'DESACTIVADO: Este satélite no asignará IPs (evita conflicto con el router principal).',
+                    style: TextStyle(fontSize: 12, color: _dhcpEnabled ? Colors.grey : const Color(0xFFFCA5A5)),
+                  ),
+                  value: _dhcpEnabled,
+                  activeColor: const Color(0xFF10B981),
+                  onChanged: (val) {
+                    setState(() => _dhcpEnabled = val);
+                  },
+                ),
+
+                const Divider(height: 20),
+
+                if (_dhcpEnabled) ...[
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _dhcpStartController,
+                          keyboardType: TextInputType.number,
+                          style: const TextStyle(color: Colors.white),
+                          decoration: const InputDecoration(labelText: 'IP Inicio Rango', border: OutlineInputBorder()),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: TextField(
+                          controller: _dhcpLimitController,
+                          keyboardType: TextInputType.number,
+                          style: const TextStyle(color: Colors.white),
+                          decoration: const InputDecoration(labelText: 'Límite IPs', border: OutlineInputBorder()),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                ],
+
                 DropdownButtonFormField<String>(
                   value: _selectedDns.contains('1.1.1.1') ? '1.1.1.1,1.0.0.1' : (_selectedDns.contains('8.8.8.8') ? '8.8.8.8,8.8.4.4' : '1.1.1.1,1.0.0.1'),
                   decoration: const InputDecoration(labelText: 'Servidores DNS', border: OutlineInputBorder()),
@@ -863,12 +1287,15 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 ElevatedButton(
                   onPressed: _isLoading ? null : _saveDhcp,
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF6366F1),
+                    backgroundColor: _dhcpEnabled ? const Color(0xFF6366F1) : const Color(0xFFDC2626),
                     foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    padding: const EdgeInsets.symmetric(vertical: 13),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   ),
-                  child: const Text('Actualizar DHCP y DNS', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+                  child: Text(
+                    _dhcpEnabled ? 'Actualizar DHCP y DNS' : 'Confirmar Apagado de DHCP',
+                    style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+                  ),
                 ),
               ],
             ),
@@ -877,7 +1304,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
 
         const SizedBox(height: 16),
 
-        // Card Port Forwarding
+        // 4. Card Port Forwarding
         Card(
           color: const Color(0xFF1E293B),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -886,7 +1313,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const Text('Reenvío de Puertos (Port Forward)', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white)),
+                const Text('Reenvío de Puertos (Port Forward)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
                 const SizedBox(height: 12),
                 TextField(
                   controller: _pfNameController,
@@ -951,10 +1378,10 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF059669),
                     foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    padding: const EdgeInsets.symmetric(vertical: 13),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   ),
-                  child: const Text('Abrir Puerto', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+                  child: const Text('Abrir Puerto', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
                 ),
               ],
             ),
