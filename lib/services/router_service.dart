@@ -87,6 +87,24 @@ class SatelliteQuality {
   });
 }
 
+class WirelessScanResult {
+  final String mac;
+  final String ssid;
+  final int signal;
+  final int channel;
+  final String encryption;
+  final bool isMotorola;
+
+  WirelessScanResult({
+    required this.mac,
+    required this.ssid,
+    required this.signal,
+    required this.channel,
+    required this.encryption,
+    required this.isMotorola,
+  });
+}
+
 class RouterService {
   /// Desbloquea y arranca LuCI y SSH directamente desde la app mediante POST con contraseña,
   /// preservando las cookies de sesión (sysauth / sysauth_https) y verificando el puerto 22
@@ -677,6 +695,72 @@ class RouterService {
     try {
       await executeSSH(ip, password, script);
     } catch (_) {}
+  }
+
+  /// Dispara el emparejamiento WPS Push-Button (PBC) en el router principal
+  static Future<bool> triggerWps(String ip, String password) async {
+    const script = '''
+      (hostapd_cli -i wlan0 wps_pbc 2>/dev/null || true)
+      (hostapd_cli -i wlan1 wps_pbc 2>/dev/null || true)
+      (hostapd_cli wps_pbc 2>/dev/null || true)
+      (ubus call hostapd.wlan0 wps_start 2>/dev/null || true)
+      (ubus call hostapd.wlan1 wps_start 2>/dev/null || true)
+      (wps_pbc 2>/dev/null || true)
+      (wl -i wl0 wps_pbc 2>/dev/null || true)
+      (wl -i wl1 wps_pbc 2>/dev/null || true)
+      echo "WPS_TRIGGERED"
+    ''';
+    try {
+      await executeSSH(ip, password, script);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Escaneo real del aire (RF Site Survey) para detectar nodos satélites cercanos y su señal
+  static Future<List<WirelessScanResult>> scanWirelessAir(String ip, String password) async {
+    const script = '''
+      (iwinfo wlan0 scan 2>/dev/null || iwinfo wlan1 scan 2>/dev/null || iw dev wlan0 scan 2>/dev/null || wl -i wl0 scan && sleep 1 && wl -i wl0 scanresults 2>/dev/null) || true
+    ''';
+    final output = await executeSSH(ip, password, script);
+    final results = <WirelessScanResult>[];
+
+    final blocks = output.split(RegExp(r'(?:Cell \d+|BSS [0-9a-fA-F:]{17})'));
+    for (final block in blocks) {
+      if (block.trim().isEmpty) continue;
+
+      final macMatch = RegExp(r'(?:Address:|BSS)\s*([0-9a-fA-F:]{17})', caseSensitive: false).firstMatch(block);
+      final ssidMatch = RegExp(r'(?:ESSID:|SSID:)\s*["' + "'" + r']?([^"' + "'" + r'\n\r]+)["' + "'" + r']?', caseSensitive: false).firstMatch(block);
+      final signalMatch = RegExp(r'(?:Signal:|signal:)\s*(-?\d+)\s*dBm', caseSensitive: false).firstMatch(block);
+      final chanMatch = RegExp(r'(?:Channel:|channel)\s*(\d+)', caseSensitive: false).firstMatch(block);
+      final encMatch = RegExp(r'(?:Encryption:|encryption:)\s*([^\n\r]+)', caseSensitive: false).firstMatch(block);
+
+      final mac = macMatch?.group(1)?.toUpperCase() ?? '';
+      String ssid = ssidMatch?.group(1)?.trim() ?? 'Red Oculta';
+      final signal = int.tryParse(signalMatch?.group(1) ?? '-80') ?? -80;
+      final channel = int.tryParse(chanMatch?.group(1) ?? '0') ?? 0;
+      final encryption = encMatch?.group(1)?.trim() ?? 'WPA2';
+
+      if (mac.isNotEmpty) {
+        final isMoto = ssid.toLowerCase().contains('moto') ||
+                       mac.startsWith('C8:C7:50') ||
+                       mac.startsWith('00:0C:E7') ||
+                       mac.startsWith('14:59:C0');
+        if (ssid == 'Red Oculta' && isMoto) ssid = 'Nodo Motorola Mesh';
+        results.add(WirelessScanResult(
+          mac: mac,
+          ssid: ssid,
+          signal: signal,
+          channel: channel,
+          encryption: encryption,
+          isMotorola: isMoto,
+        ));
+      }
+    }
+
+    results.sort((a, b) => b.signal.compareTo(a.signal));
+    return results;
   }
 
   /// Restablece el equipo a los valores de fábrica predeterminados (Reset Default)
