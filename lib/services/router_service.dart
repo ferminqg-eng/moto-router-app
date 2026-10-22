@@ -818,6 +818,13 @@ class RouterService {
     required String mainKey,
     String connectionMode = 'cable',
   }) async {
+    // PASO 1: Desbloquear LuCI y arrancar Dropbear SSH en el satélite
+    final unlocked = await unlockRouter(satIp, satPassword);
+    if (!unlocked) {
+      throw Exception('No se pudo desbloquear el satélite en $satIp. Verifica que estés conectado a su red Wi-Fi o cable y que la clave de etiqueta sea correcta.');
+    }
+    await Future.delayed(const Duration(seconds: 3));
+
     String script = '';
 
     if (connectionMode == 'cable') {
@@ -898,7 +905,10 @@ class RouterService {
 
     try {
       await executeSSH(satIp, satPassword, script);
-    } catch (_) {}
+    } catch (_) {
+      // Al reiniciar la interfaz de red con la nueva IP, la sesión SSH se cierra normalmente
+    }
+  }
   }
 
   /// Restablece el equipo a los valores de fábrica predeterminados (Reset Default)
