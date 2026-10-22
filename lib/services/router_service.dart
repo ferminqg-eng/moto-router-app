@@ -205,12 +205,12 @@ class RouterService {
     }
   }
 
-  /// Lee estado general, modelo, hostname, estado de Minim y clientes conectados
+  /// Lee estado general, modelo, hostname, estado de Minim/Unum y clientes conectados
   static Future<RouterStatus> getStatus(String ip, String password) async {
     const script = '''
       echo "===UPTIME===" && cat /proc/uptime
       echo "===HOSTNAME===" && (cat /proc/sys/kernel/hostname 2>/dev/null || uci -q get system.@system[0].hostname || echo "Router Principal")
-      echo "===MINIM===" && (pgrep minim || pgrep minimd || ps | grep -E "minim|minimd" | grep -v grep || echo "STOPPED")
+      echo "===MINIM===" && (ps | grep -v grep | grep -E "unum|minim" || echo "STOPPED")
       echo "===LEASES===" && cat /tmp/dhcp.leases 2>/dev/null || cat /var/dhcp.leases 2>/dev/null
       echo "===ARP===" && cat /proc/net/arp 2>/dev/null
       echo "===MODEL===" && cat /tmp/sysinfo/model 2>/dev/null || cat /proc/cpuinfo | grep -m1 'model name'
@@ -294,15 +294,43 @@ class RouterService {
     await executeSSH(ip, password, script);
   }
 
-  /// Detiene y deshabilita el agente Minim Cloud para siempre
+  /// Detiene y deshabilita permanentemente el agente de la nube unum (Minim/MotoSync)
   static Future<void> disableMinim(String ip, String password) async {
     const script = '''
+      /etc/init.d/unum stop 2>/dev/null || true
+      /etc/init.d/unum disable 2>/dev/null || true
       /etc/init.d/minim stop 2>/dev/null || true
       /etc/init.d/minim disable 2>/dev/null || true
-      killall minim 2>/dev/null || true
-      killall minimd 2>/dev/null || true
+      killall -9 unum 2>/dev/null || true
+      killall -9 minim 2>/dev/null || true
+      killall -9 minimd 2>/dev/null || true
+      chmod 644 /usr/bin/unum 2>/dev/null || true
+      rm -f /tmp/provision_info.json 2>/dev/null || true
     ''';
     await executeSSH(ip, password, script);
+  }
+
+  /// Obtiene diagnóstico a bajo nivel del router (unum, NVRAM, driver wl, bridge)
+  static Future<Map<String, String>> getDiagnosticInfo(String ip, String password) async {
+    const script = '''
+      echo "===UNUM===" && (ps | grep -v grep | grep -E "unum|minim" || echo "DETENIDO_OK")
+      echo "===NVRAM_SSID===" && (nvram get wl0_ssid 2>/dev/null || echo "N/A")
+      echo "===NVRAM_SSID5===" && (nvram get wl1_ssid 2>/dev/null || echo "N/A")
+      echo "===WL0_SSID===" && (wl -i wl0 ssid 2>/dev/null || echo "N/A")
+      echo "===WL1_SSID===" && (wl -i wl1 ssid 2>/dev/null || echo "N/A")
+      echo "===UCI_SSID===" && (uci -q get wireless.@wifi-iface[0].ssid || echo "N/A")
+      echo "===HOSTNAME===" && (cat /proc/sys/kernel/hostname 2>/dev/null || echo "N/A")
+      echo "===INTERFACES===" && (ifconfig -s 2>/dev/null || echo "N/A")
+    ''';
+    final output = await executeSSH(ip, password, script);
+    final parts = output.split('===');
+    final map = <String, String>{};
+    for (int i = 1; i < parts.length; i += 2) {
+      final tag = parts[i].trim();
+      final val = i + 1 < parts.length ? parts[i + 1].trim() : '';
+      map[tag] = val;
+    }
+    return map;
   }
 
   /// Reinicia el router de forma remota
@@ -392,21 +420,61 @@ class RouterService {
   }
 
   /// Aplica cambios Wi-Fi (bandas, cifrado, potencia de transmisión y modo legacy Wi-Fi 6)
-  /// Apaga Minim primero y fuerza el reinicio real de los drivers Broadcom
+  /// Neutraliza unum, persiste en NVRAM, inyecta directamente al chip Broadcom wl y en UCI
   static Future<void> saveWifiConfig(String ip, String password, WifiConfigData cfg) async {
     final commands = <String>[];
 
-    // 1. Apagar Minim para evitar que sobreescriba cambios locales
-    commands.add("/etc/init.d/minim stop 2>/dev/null || true");
-    commands.add("/etc/init.d/minim disable 2>/dev/null || true");
-    commands.add("killall minim 2>/dev/null || true");
-    commands.add("killall minimd 2>/dev/null || true");
+    // 1. Apagar y neutralizar permanentemente unum/minim
+    commands.add('''
+      /etc/init.d/unum stop 2>/dev/null || true
+      /etc/init.d/unum disable 2>/dev/null || true
+      /etc/init.d/minim stop 2>/dev/null || true
+      /etc/init.d/minim disable 2>/dev/null || true
+      killall -9 unum 2>/dev/null || true
+      killall -9 minim 2>/dev/null || true
+      killall -9 minimd 2>/dev/null || true
+      chmod 644 /usr/bin/unum 2>/dev/null || true
+      rm -f /tmp/provision_info.json 2>/dev/null || true
+    ''');
 
-    // 2. Ajustar potencia de transmisión (Tx Power) en ambos radios (2.4 y 5 GHz)
+    final ssid24 = cfg.ssid24;
+    final key24 = cfg.key24;
+    final enc24 = cfg.enc24;
+    final ssid5 = cfg.separateBands ? cfg.ssid5 : cfg.ssid24;
+    final key5 = cfg.separateBands ? cfg.key5 : cfg.key24;
+    final enc5 = cfg.separateBands ? cfg.enc5 : cfg.enc24;
+
+    // 2. Persistir en NVRAM (Broadcom wl carga de aquí en boot)
+    commands.add('''
+      if which nvram >/dev/null 2>&1; then
+        ${ssid24.isNotEmpty ? "nvram set wl0_ssid='$ssid24'" : ""}
+        ${ssid5.isNotEmpty ? "nvram set wl1_ssid='$ssid5'" : ""}
+        ${ssid24.isNotEmpty ? "nvram set wl_ssid='$ssid24'" : ""}
+        ${key24.isNotEmpty ? "nvram set wl0_wpa_psk='$key24'" : ""}
+        ${key5.isNotEmpty ? "nvram set wl1_wpa_psk='$key5'" : ""}
+        ${key24.isNotEmpty ? "nvram set wl_wpa_psk='$key24'" : ""}
+        nvram set wl0_akm='psk2'
+        nvram set wl1_akm='psk2'
+        nvram set wl0_txpwr='${cfg.txPower}'
+        nvram set wl1_txpwr='${cfg.txPower}'
+        nvram commit 2>/dev/null || true
+      fi
+    ''');
+
+    // 3. Inyección inmediata en caliente a los radios Broadcom wl
+    commands.add('''
+      ${ssid24.isNotEmpty ? "wl -i wl0 ssid '$ssid24' 2>/dev/null || true" : ""}
+      ${ssid5.isNotEmpty ? "wl -i wl1 ssid '$ssid5' 2>/dev/null || true" : ""}
+      ${key24.isNotEmpty ? "wl -i wl0 wpa_psk '$key24' 2>/dev/null || true" : ""}
+      ${key5.isNotEmpty ? "wl -i wl1 wpa_psk '$key5' 2>/dev/null || true" : ""}
+      wl -i wl0 txpwr1 -d ${cfg.txPower} 2>/dev/null || true
+      wl -i wl1 txpwr1 -d ${cfg.txPower} 2>/dev/null || true
+    ''');
+
+    // 4. Ajustar potencia y modo legacy en OpenWrt UCI
     commands.add("uci -q set wireless.radio0.txpower='${cfg.txPower}'");
     commands.add("uci -q set wireless.radio1.txpower='${cfg.txPower}'");
 
-    // 3. Modo de compatibilidad para clientes sin Wi-Fi 6 (Desactivar 802.11ax en 2.4 GHz)
     if (cfg.legacyMode) {
       commands.add("uci -q set wireless.radio0.legacy_mode='1'");
       commands.add("uci -q set wireless.radio0.hwmode='11g'");
@@ -418,40 +486,37 @@ class RouterService {
       commands.add("uci -q set wireless.radio0.htmode='HE40'");
     }
 
-    // 4. Configurar interfaces inalámbricas (SSID, Clave, Cifrado)
+    // 5. Configurar interfaces inalámbricas UCI
     if (cfg.separateBands) {
-      // 2.4 GHz y 5 GHz independientes
       commands.add('''
         for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
           dev=\$(uci -q get wireless.\${iface}.device)
           if echo "\$dev" | grep -qE "5|wlan1|radio1"; then
-            ${cfg.ssid5.isNotEmpty ? "uci set wireless.\${iface}.ssid='${cfg.ssid5}'" : ""}
-            ${cfg.key5.isNotEmpty ? "uci set wireless.\${iface}.key='${cfg.key5}'" : ""}
-            uci set wireless.\${iface}.encryption='${cfg.enc5}'
+            ${ssid5.isNotEmpty ? "uci set wireless.\${iface}.ssid='$ssid5'" : ""}
+            ${key5.isNotEmpty ? "uci set wireless.\${iface}.key='$key5'" : ""}
+            uci set wireless.\${iface}.encryption='$enc5'
           else
-            ${cfg.ssid24.isNotEmpty ? "uci set wireless.\${iface}.ssid='${cfg.ssid24}'" : ""}
-            ${cfg.key24.isNotEmpty ? "uci set wireless.\${iface}.key='${cfg.key24}'" : ""}
-            uci set wireless.\${iface}.encryption='${cfg.enc24}'
+            ${ssid24.isNotEmpty ? "uci set wireless.\${iface}.ssid='$ssid24'" : ""}
+            ${key24.isNotEmpty ? "uci set wireless.\${iface}.key='$key24'" : ""}
+            uci set wireless.\${iface}.encryption='$enc24'
           fi
           uci set wireless.\${iface}.disabled='0'
         done
       ''');
     } else {
-      // Banda Unificada
       commands.add('''
         for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
-          ${cfg.ssid24.isNotEmpty ? "uci set wireless.\${iface}.ssid='${cfg.ssid24}'" : ""}
-          ${cfg.key24.isNotEmpty ? "uci set wireless.\${iface}.key='${cfg.key24}'" : ""}
-          uci set wireless.\${iface}.encryption='${cfg.enc24}'
+          ${ssid24.isNotEmpty ? "uci set wireless.\${iface}.ssid='$ssid24'" : ""}
+          ${key24.isNotEmpty ? "uci set wireless.\${iface}.key='$key24'" : ""}
+          uci set wireless.\${iface}.encryption='$enc24'
           uci set wireless.\${iface}.disabled='0'
         done
       ''');
     }
 
-    // 5. Commit y reinicio real en segundo plano
+    // 6. Commit y reinicio del subsistema wireless
     commands.add('uci commit wireless');
-    commands.add('(/etc/init.d/network restart) &');
-    commands.add('(sleep 2 && wifi down && sleep 1 && wifi up) &');
+    commands.add('(wifi down 2>/dev/null; sleep 1; wifi up 2>/dev/null; /etc/init.d/network restart 2>/dev/null) &');
 
     try {
       await executeSSH(ip, password, commands.join('\n'));
@@ -876,6 +941,7 @@ class RouterService {
 
   /// Aprovisionamiento Guiado Inalámbrico del Satélite desde el teléfono
   /// (Conectado a la red de fábrica en 192.168.1.1)
+  /// Neutraliza unum, clona NVRAM, inyecta en wl con modo WET, unifica br-lan, fija IP y apaga DHCP
   static Future<void> provisionSatelliteDirect({
     required String satIp,
     required String satPassword,
@@ -895,26 +961,51 @@ class RouterService {
     final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
     final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
 
-    // PASO 2: Configuración híbrida completa (Switch + Wi-Fi Backhaul + Hostname + Sin Minim)
+    // PASO 2: Configuración híbrida completa (Switch + WET Backhaul + Hostname + Neutralizar Unum + NVRAM)
     final script = '''
-      # 1. Nombre del Satélite
+      # 1. Neutralizar completamente el agente de nube unum/minim
+      /etc/init.d/unum stop 2>/dev/null || true
+      /etc/init.d/unum disable 2>/dev/null || true
+      /etc/init.d/minim stop 2>/dev/null || true
+      /etc/init.d/minim disable 2>/dev/null || true
+      killall -9 unum 2>/dev/null || true
+      killall -9 minim 2>/dev/null || true
+      killall -9 minimd 2>/dev/null || true
+      chmod 644 /usr/bin/unum 2>/dev/null || true
+      rm -f /tmp/provision_info.json 2>/dev/null || true
+
+      # 2. Nombre del Satélite
       uci set system.@system[0].hostname='$cleanHost'
       echo '$cleanHost' > /proc/sys/kernel/hostname
       uci commit system
 
-      # 2. Desactivar Minim para siempre
-      /etc/init.d/minim stop 2>/dev/null || true
-      /etc/init.d/minim disable 2>/dev/null || true
-      killall minim 2>/dev/null || true
-      killall minimd 2>/dev/null || true
+      # 3. Persistir SSID y credenciales en NVRAM del satélite
+      if which nvram >/dev/null 2>&1; then
+        nvram set router_name='$cleanHost'
+        ${mainSsid.isNotEmpty ? "nvram set wl0_ssid='$mainSsid'" : ""}
+        ${mainSsid.isNotEmpty ? "nvram set wl1_ssid='$mainSsid'" : ""}
+        ${mainSsid.isNotEmpty ? "nvram set wl_ssid='$mainSsid'" : ""}
+        ${mainKey.isNotEmpty ? "nvram set wl0_wpa_psk='$mainKey'" : ""}
+        ${mainKey.isNotEmpty ? "nvram set wl1_wpa_psk='$mainKey'" : ""}
+        ${mainKey.isNotEmpty ? "nvram set wl_wpa_psk='$mainKey'" : ""}
+        nvram set wl0_akm='psk2'
+        nvram set wl1_akm='psk2'
+        nvram commit 2>/dev/null || true
+      fi
 
-      # 3. Unificar puertos WAN (eth1) y LAN (eth0) en br-lan (Switch transparente sin bloqueo)
+      # 4. Inyección en caliente a los radios Broadcom del satélite
+      ${mainSsid.isNotEmpty ? "wl -i wl0 ssid '$mainSsid' 2>/dev/null || true" : ""}
+      ${mainSsid.isNotEmpty ? "wl -i wl1 ssid '$mainSsid' 2>/dev/null || true" : ""}
+      ${mainKey.isNotEmpty ? "wl -i wl0 wpa_psk '$mainKey' 2>/dev/null || true" : ""}
+      ${mainKey.isNotEmpty ? "wl -i wl1 wpa_psk '$mainKey' 2>/dev/null || true" : ""}
+
+      # 5. Unificar puertos WAN (eth1) y LAN (eth0) en br-lan (Modo Switch total transparente)
       uci -q delete network.wan
       uci -q delete network.wan6
       uci -q set network.lan.ifname='eth0 eth1'
       uci -q set network.lan.type='bridge'
 
-      # 4. Configurar IP fija final y Puerta de enlace al Router Principal
+      # 6. Configurar IP fija final y Puerta de enlace al Router Principal
       uci set network.lan.ipaddr='$targetIp'
       uci set network.lan.netmask='255.255.255.0'
       uci set network.lan.gateway='$mainGateway'
@@ -922,13 +1013,13 @@ class RouterService {
       uci add_list network.lan.dns='$mainGateway'
       uci commit network
 
-      # 5. Apagar Servidor DHCP y dnsmasq para evitar conflictos de IP
+      # 7. Apagar Servidor DHCP y dnsmasq para evitar conflictos de IP
       uci set dhcp.lan.ignore='1'
       uci commit dhcp
       /etc/init.d/dnsmasq stop 2>/dev/null || true
       /etc/init.d/dnsmasq disable 2>/dev/null || true
 
-      # 6. Clonar emisión Wi-Fi (misma red y contraseña)
+      # 8. Clonar emisión Wi-Fi en UCI
       for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
         ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
         ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
@@ -936,12 +1027,13 @@ class RouterService {
         uci set wireless.\${iface}.disabled='0'
       done
 
-      # 7. Configurar enlace cliente inalámbrico de retorno (Mesh STA Backhaul)
+      # 9. Enlace Cliente Retorno Inalámbrico Mesh (Modo WET Broadcom para bridging L2 real)
       ${(mainSsid.isNotEmpty && mainKey.isNotEmpty) ? """
       uci -q delete wireless.mesh_sta
       uci set wireless.mesh_sta=wifi-iface
       uci set wireless.mesh_sta.device='radio1'
       uci set wireless.mesh_sta.mode='sta'
+      uci set wireless.mesh_sta.wet='1'
       uci set wireless.mesh_sta.network='lan'
       uci set wireless.mesh_sta.ssid='$mainSsid'
       uci set wireless.mesh_sta.key='$mainKey'
@@ -949,7 +1041,11 @@ class RouterService {
       """ : ""}
       uci commit wireless
 
-      # 8. Reiniciar red y drivers Broadcom
+      # 10. Activar WET directo en Broadcom wl1 (5GHz backhaul)
+      wl -i wl1 wet 1 2>/dev/null || true
+      ${mainSsid.isNotEmpty ? "wl -i wl1 join '$mainSsid' key '$mainKey' 2>/dev/null || true" : ""}
+
+      # 11. Reinicio de red
       (/etc/init.d/network restart) &
       (sleep 2 && wifi down && sleep 1 && wifi up) &
     ''';
