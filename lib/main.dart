@@ -1554,163 +1554,12 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        // 1. TARJETA DE RADAR MESH / SITE SURVEY (RF BROADCOM & DHCP)
+        // 1. TARJETA PRINCIPAL: AGREGAR DISPOSITIVO MESH
         Card(
           color: const Color(0xFF1E293B),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: Color(0xFF38BDF8), width: 1.2),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Row(
-                  children: [
-                    Icon(Icons.radar, color: Color(0xFF38BDF8), size: 24),
-                    SizedBox(width: 8),
-                    Expanded(
-                      child: Text('Radar Mesh / Escaneo RF', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                const Text(
-                  'Escanea el aire para detectar tu Router Principal Motorola. Toca "Usar" en tu red para seleccionarla automáticamente y vincular tus satélites.',
-                  style: TextStyle(fontSize: 12, color: Colors.grey),
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        onPressed: _isScanningAir ? null : _scanWirelessAir,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF0D9488),
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(vertical: 10),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                        ),
-                        icon: _isScanningAir
-                            ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                            : const Icon(Icons.air, size: 16),
-                        label: Text(_isScanningAir ? 'Escaneando...' : 'Aire RF (Broadcom)', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        onPressed: _isScanningMesh ? null : _scanMeshNodes,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF0284C7),
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(vertical: 10),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                        ),
-                        icon: _isScanningMesh
-                            ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                            : const Icon(Icons.refresh, size: 16),
-                        label: Text(_isScanningMesh ? 'Buscando...' : 'Clientes DHCP', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-
-                // Resultados del escaneo aéreo RF con botón USAR / SELECCIONAR
-                if (_airScanResults.isNotEmpty) ...[
-                  Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF134E4A),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text('📡 Señales en el Aire (${_airScanResults.length})', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
-                        TextButton(
-                          onPressed: () => setState(() => _airScanResults = []),
-                          child: const Text('Limpiar', style: TextStyle(color: Colors.cyanAccent, fontSize: 11)),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  ..._airScanResults.map((r) => Container(
-                    margin: const EdgeInsets.only(bottom: 6),
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: r.isMotorola ? const Color(0xFF1E3A8A).withOpacity(0.4) : const Color(0xFF0F172A),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: r.isMotorola ? Colors.cyanAccent : const Color(0xFF334155)),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(Icons.wifi, color: r.signal >= -65 ? Colors.greenAccent : (r.signal >= -78 ? Colors.amberAccent : Colors.redAccent), size: 18),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: Text(
-                                      r.ssid,
-                                      style: TextStyle(fontWeight: FontWeight.bold, color: r.isMotorola ? Colors.cyanAccent : Colors.white, fontSize: 13),
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                  ),
-                                  if (r.isMotorola) ...[
-                                    const SizedBox(width: 6),
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                                      decoration: BoxDecoration(color: const Color(0xFF2563EB), borderRadius: BorderRadius.circular(4)),
-                                      child: const Text('MOTOROLA', style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.white)),
-                                    ),
-                                  ],
-                                ],
-                              ),
-                              Text('MAC: ${r.mac} • Canal: ${r.channel} • ${r.signal} dBm', style: const TextStyle(color: Colors.grey, fontSize: 10)),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        ElevatedButton.icon(
-                          onPressed: () {
-                            setState(() {
-                              _provSsidController.text = r.ssid;
-                            });
-                            _showSnack('Red "${r.ssid}" seleccionada como Wi-Fi principal.');
-                          },
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: r.isMotorola ? const Color(0xFF0284C7) : const Color(0xFF334155),
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                          ),
-                          icon: const Icon(Icons.check_circle_outline, size: 14),
-                          label: const Text('Usar', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                        ),
-                      ],
-                    ),
-                  )),
-                ],
-              ],
-            ),
-          ),
-        ),
-
-        const SizedBox(height: 16),
-
-        // 2. ASISTENTE GUIADO: APROVISIONAR SATÉLITE
-        Card(
-          color: const Color(0xFF0F172A),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: Color(0xFF10B981), width: 1.5),
+            side: const BorderSide(color: Color(0xFF38BDF8), width: 1.5),
           ),
           child: Padding(
             padding: const EdgeInsets.all(16),
@@ -1720,222 +1569,261 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 Row(
                   children: [
                     Container(
-                      padding: const EdgeInsets.all(8),
+                      padding: const EdgeInsets.all(10),
                       decoration: BoxDecoration(
-                        color: const Color(0xFF065F46),
-                        borderRadius: BorderRadius.circular(10),
+                        color: const Color(0xFF0284C7).withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(12),
                       ),
-                      child: const Icon(Icons.auto_fix_high, color: Colors.greenAccent, size: 22),
+                      child: const Icon(Icons.hub, color: Color(0xFF38BDF8), size: 26),
                     ),
-                    const SizedBox(width: 10),
+                    const SizedBox(width: 12),
                     const Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('Asistente Guiado: Aprovisionar Satélite', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
-                          Text('Desbloquea SSH, apaga DHCP y fija IP estática', style: TextStyle(fontSize: 11, color: Colors.greenAccent)),
+                          Text('Agregar Dispositivo Mesh', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
+                          Text('Empareja tu satélite en 3 simples pasos', style: TextStyle(fontSize: 12, color: Color(0xFF38BDF8))),
                         ],
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 12),
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1E293B),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: Colors.white12),
-                  ),
-                  child: const Text(
-                    'Instrucciones paso a paso:\n'
-                    '1. Enciende el satélite adicional (espera a que su luz LED parpadee en azul).\n'
-                    '2. En tu celular, conéctate temporalmente a su red Wi-Fi de fábrica (o conéctalo por cable directo a tu PC/red).\n'
-                    '3. Selecciona la red en el Radar arriba o escribe el SSID, coloca las claves y pulsa Aprovisionar.\n'
-                    '✨ La app desbloqueará el satélite, unificará WAN/LAN en Switch Universal (cero bloqueos), apagará su DHCP y clonará tu Wi-Fi con Roaming 802.11r.',
-                    style: TextStyle(fontSize: 11, color: Colors.white70, height: 1.4),
-                  ),
-                ),
                 const SizedBox(height: 14),
-
-                // Selector de Satélite Destino (Satélite 2 o Satélite 3)
-                const Text('1. ¿Qué nodo estás configurando?', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white70)),
-                const SizedBox(height: 6),
-                Row(
-                  children: [
-                    Expanded(
-                      child: ChoiceChip(
-                        label: const Center(child: Text('Satélite 2 (192.168.1.2)')),
-                        selected: _provSelectedSat == 'sat2',
-                        selectedColor: const Color(0xFF2563EB),
-                        labelStyle: TextStyle(
-                          color: _provSelectedSat == 'sat2' ? Colors.white : Colors.grey,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12,
-                        ),
-                        onSelected: (val) {
-                          if (val) setState(() => _provSelectedSat = 'sat2');
-                        },
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: ChoiceChip(
-                        label: const Center(child: Text('Satélite 3 (192.168.1.3)')),
-                        selected: _provSelectedSat == 'sat3',
-                        selectedColor: const Color(0xFF4F46E5),
-                        labelStyle: TextStyle(
-                          color: _provSelectedSat == 'sat3' ? Colors.white : Colors.grey,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12,
-                        ),
-                        onSelected: (val) {
-                          if (val) setState(() => _provSelectedSat = 'sat3');
-                        },
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-
-                // Selector de Modo de Enlace (Cable o Inalámbrico)
-                const Text('2. Modo de Conexión Mesh:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white70)),
-                const SizedBox(height: 6),
-                Row(
-                  children: [
-                    Expanded(
-                      child: ChoiceChip(
-                        avatar: const Icon(Icons.cable, size: 16, color: Colors.white),
-                        label: const Center(child: Text('Cable (Universal Bridge)')),
-                        selected: _provConnMode == 'cable',
-                        selectedColor: const Color(0xFF059669),
-                        labelStyle: TextStyle(
-                          color: _provConnMode == 'cable' ? Colors.white : Colors.grey,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 11,
-                        ),
-                        onSelected: (val) {
-                          if (val) setState(() => _provConnMode = 'cable');
-                        },
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: ChoiceChip(
-                        avatar: const Icon(Icons.wifi, size: 16, color: Colors.white),
-                        label: const Center(child: Text('Inalámbrico (Wi-Fi STA)')),
-                        selected: _provConnMode == 'wireless',
-                        selectedColor: const Color(0xFF0284C7),
-                        labelStyle: TextStyle(
-                          color: _provConnMode == 'wireless' ? Colors.white : Colors.grey,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 11,
-                        ),
-                        onSelected: (val) {
-                          if (val) setState(() => _provConnMode = 'wireless');
-                        },
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-
-                // Inputs del Satélite
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _provSatIpController,
-                        style: const TextStyle(color: Colors.white, fontSize: 13),
-                        decoration: const InputDecoration(
-                          labelText: 'IP Actual del Satélite',
-                          hintText: '192.168.1.1',
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                          helperText: 'Fábrica: 192.168.1.1',
-                          helperStyle: TextStyle(fontSize: 10, color: Colors.grey),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: TextField(
-                        controller: _provSatPassController,
-                        obscureText: _isProvPassObscure,
-                        style: const TextStyle(color: Colors.white, fontSize: 13),
-                        decoration: InputDecoration(
-                          labelText: 'Clave de su etiqueta',
-                          border: const OutlineInputBorder(),
-                          isDense: true,
-                          helperText: 'Admin password',
-                          helperStyle: const TextStyle(fontSize: 10, color: Colors.grey),
-                          suffixIcon: IconButton(
-                            icon: Icon(_isProvPassObscure ? Icons.visibility : Icons.visibility_off, color: Colors.grey, size: 18),
-                            onPressed: () => setState(() => _isProvPassObscure = !_isProvPassObscure),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-
-                // Wi-Fi Principal a Clonar
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _provSsidController,
-                        style: const TextStyle(color: Colors.white, fontSize: 13),
-                        decoration: InputDecoration(
-                          labelText: 'Wi-Fi Principal (SSID)',
-                          hintText: _ssid24Controller.text.isNotEmpty ? _ssid24Controller.text : 'LanRouterWiFi',
-                          border: const OutlineInputBorder(),
-                          isDense: true,
-                          helperText: 'O selecciona en Radar arriba',
-                          helperStyle: const TextStyle(fontSize: 10, color: Colors.grey),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: TextField(
-                        controller: _provKeyController,
-                        style: const TextStyle(color: Colors.white, fontSize: 13),
-                        decoration: const InputDecoration(
-                          labelText: 'Clave Wi-Fi Principal',
-                          hintText: 'Contraseña del Wi-Fi',
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                          helperText: 'Clave de red a clonar',
-                          helperStyle: TextStyle(fontSize: 10, color: Colors.grey),
-                        ),
-                      ),
-                    ),
-                  ],
+                const Text(
+                  '1. Enciende el satélite adicional (espera luz azul parpadeando).\n'
+                  '2. Presiona "Escanear Redes Wi-Fi" y toca la red de tu Router Principal.\n'
+                  '3. Ingresa la clave y pulsa "Vincular Satélite".',
+                  style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.4),
                 ),
                 const SizedBox(height: 16),
-
                 ElevatedButton.icon(
-                  onPressed: _isProvisioning ? null : _runDirectProvisioning,
+                  onPressed: _isScanningAir ? null : _scanWirelessAir,
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF10B981),
+                    backgroundColor: const Color(0xFF0284C7),
                     foregroundColor: Colors.white,
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   ),
-                  icon: _isProvisioning
+                  icon: _isScanningAir
                       ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                      : const Icon(Icons.rocket_launch, color: Colors.white),
+                      : const Icon(Icons.radar, color: Colors.white),
                   label: Text(
-                    _isProvisioning ? 'Desbloqueando y Aprovisionando...' : 'Aprovisionar Satélite Ahora',
-                    style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white),
+                    _isScanningAir ? 'Escaneando redes en el aire...' : 'Escanear Redes Wi-Fi',
+                    style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
                   ),
                 ),
               ],
             ),
           ),
         ),
+
+        const SizedBox(height: 16),
+
+        // 2. LISTA DE REDES DISPONIBLES CON CALIDAD DE SEÑAL
+        if (_airScanResults.isNotEmpty) ...[
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('📡 Redes Detectadas (${_airScanResults.length})', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+              TextButton(
+                onPressed: () => setState(() => _airScanResults = []),
+                child: const Text('Limpiar', style: TextStyle(color: Colors.cyanAccent, fontSize: 12)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ..._airScanResults.map((r) {
+            final isSelected = _provSsidController.text == r.ssid;
+            return Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              decoration: BoxDecoration(
+                color: isSelected
+                    ? const Color(0xFF0369A1).withOpacity(0.3)
+                    : (r.isMotorola ? const Color(0xFF1E3A8A).withOpacity(0.35) : const Color(0xFF1E293B)),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: isSelected ? Colors.cyanAccent : (r.isMotorola ? const Color(0xFF38BDF8) : const Color(0xFF334155)),
+                  width: isSelected ? 2 : 1,
+                ),
+              ),
+              child: ListTile(
+                onTap: () {
+                  setState(() {
+                    _provSsidController.text = r.ssid;
+                  });
+                  _showSnack('Red "${r.ssid}" seleccionada. Ingresa su clave abajo.');
+                },
+                leading: Icon(
+                  Icons.wifi,
+                  color: r.signal >= -65 ? Colors.greenAccent : (r.signal >= -78 ? Colors.amberAccent : Colors.redAccent),
+                  size: 24,
+                ),
+                title: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        r.ssid,
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: isSelected ? Colors.cyanAccent : Colors.white,
+                          fontSize: 14,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (r.isMotorola) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(color: const Color(0xFF2563EB), borderRadius: BorderRadius.circular(6)),
+                        child: const Text('MOTOROLA', style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.white)),
+                      ),
+                    ],
+                  ],
+                ),
+                subtitle: Text('Señal: ${r.signal} dBm • Canal: ${r.channel}', style: const TextStyle(color: Colors.grey, fontSize: 11)),
+                trailing: ElevatedButton(
+                  onPressed: () {
+                    setState(() {
+                      _provSsidController.text = r.ssid;
+                    });
+                    _showSnack('Red "${r.ssid}" seleccionada.');
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: isSelected ? Colors.cyanAccent : const Color(0xFF334155),
+                    foregroundColor: isSelected ? Colors.black : Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  child: Text(isSelected ? '✓ Elegida' : 'Elegir', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                ),
+              ),
+            );
+          }),
+          const SizedBox(height: 16),
+        ],
+
+        // 3. FORMULARIO SIMPLE DE VINCULACIÓN AL ELEGIR RED
+        if (_provSsidController.text.isNotEmpty) ...[
+          Card(
+            color: const Color(0xFF0F172A),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+              side: const BorderSide(color: Color(0xFF10B981), width: 1.5),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.link, color: Colors.greenAccent, size: 24),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('Vincular a: ${_provSsidController.text}', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+                            const Text('Introduce la clave de esta red para sincronizar', style: TextStyle(fontSize: 11, color: Colors.greenAccent)),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+
+                  // Clave Wi-Fi
+                  TextField(
+                    controller: _provKeyController,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: InputDecoration(
+                      labelText: 'Contraseña Wi-Fi de "${_provSsidController.text}"',
+                      border: const OutlineInputBorder(),
+                      isDense: true,
+                      prefixIcon: const Icon(Icons.wifi_password, color: Colors.cyanAccent),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // Clave etiqueta del satélite
+                  TextField(
+                    controller: _provSatPassController,
+                    obscureText: _isProvPassObscure,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: InputDecoration(
+                      labelText: 'Contraseña de la etiqueta del Satélite',
+                      border: const OutlineInputBorder(),
+                      isDense: true,
+                      helperText: 'Admin password impresa en la etiqueta inferior del satélite',
+                      helperStyle: const TextStyle(fontSize: 10, color: Colors.grey),
+                      prefixIcon: const Icon(Icons.key, color: Colors.amberAccent),
+                      suffixIcon: IconButton(
+                        icon: Icon(_isProvPassObscure ? Icons.visibility : Icons.visibility_off, color: Colors.grey, size: 18),
+                        onPressed: () => setState(() => _isProvPassObscure = !_isProvPassObscure),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+
+                  // Asignación de Satélite 2 o Satélite 3
+                  Row(
+                    children: [
+                      const Text('Asignar nodo:', style: TextStyle(fontSize: 12, color: Colors.white70)),
+                      const SizedBox(width: 10),
+                      ChoiceChip(
+                        label: const Text('Satélite 2 (192.168.1.2)'),
+                        selected: _provSelectedSat == 'sat2',
+                        selectedColor: const Color(0xFF2563EB),
+                        labelStyle: TextStyle(
+                          color: _provSelectedSat == 'sat2' ? Colors.white : Colors.grey,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 11,
+                        ),
+                        onSelected: (val) {
+                          if (val) setState(() => _provSelectedSat = 'sat2');
+                        },
+                      ),
+                      const SizedBox(width: 8),
+                      ChoiceChip(
+                        label: const Text('Satélite 3 (192.168.1.3)'),
+                        selected: _provSelectedSat == 'sat3',
+                        selectedColor: const Color(0xFF4F46E5),
+                        labelStyle: TextStyle(
+                          color: _provSelectedSat == 'sat3' ? Colors.white : Colors.grey,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 11,
+                        ),
+                        onSelected: (val) {
+                          if (val) setState(() => _provSelectedSat = 'sat3');
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 18),
+
+                  ElevatedButton.icon(
+                    onPressed: _isProvisioning ? null : _runDirectProvisioning,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF10B981),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                    icon: _isProvisioning
+                        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                        : const Icon(Icons.rocket_launch, color: Colors.white),
+                    label: Text(
+                      _isProvisioning ? 'Desbloqueando y Vinculando Satélite...' : 'Vincular Dispositivo Mesh Ahora',
+                      style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ],
     );
   }
