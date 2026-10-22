@@ -885,8 +885,6 @@ class RouterService {
       // El cambio de IP desconecta la sesión SSH normalmente
     }
   }
-  }
-  }
 
   /// Restablece el equipo a los valores de fábrica predeterminados (Reset Default)
   static Future<void> factoryReset(String ip, String password) async {
