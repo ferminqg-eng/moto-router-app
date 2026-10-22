@@ -100,6 +100,13 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   String _addSatPresetIp = '192.168.1.2';
   bool _addSatPassObscure = true;
   bool _isProvisioningSat = false;
+  int _mainChannel5 = 36;
+  int _mainChannel24 = 6;
+  String _mainBssid5 = '';
+  String _mainBssid24 = '';
+  List<WirelessScanResult> _detectedNetworks = [];
+  bool _isScanningAir = false;
+  WirelessScanResult? _selectedNetwork;
 
   // Tab 3: Control de Satélites Mesh State
   final List<MeshNode> _meshNodes = [
@@ -169,6 +176,10 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
 
         _txPower = wifi.txPower;
         _legacyMode = wifi.legacyMode;
+        _mainChannel5 = wifi.channel5;
+        _mainChannel24 = wifi.channel24;
+        _mainBssid5 = wifi.bssid5;
+        _mainBssid24 = wifi.bssid24;
       });
     } catch (_) {}
   }
@@ -393,6 +404,48 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     }
   }
 
+  // TAB 2: Escanear redes en el aire desde el satélite
+  Future<void> _scanRfFromSatellite() async {
+    final satPass = _addSatPassController.text.trim();
+    setState(() => _isScanningAir = true);
+    _showSnack('Escaneando redes Wi-Fi en el aire desde el satélite...');
+    try {
+      if (satPass.isNotEmpty) {
+        await RouterService.unlockRouter('192.168.1.1', satPass);
+      }
+      final nets = await RouterService.scanWirelessAir('192.168.1.1', satPass);
+      setState(() {
+        _detectedNetworks = nets;
+      });
+      if (nets.isEmpty) {
+        _showSnack('No se detectaron redes en el escaneo. Asegúrate de estar conectado al satélite.', isError: true);
+      } else {
+        _showSnack('Se detectaron ${nets.length} redes en el aire');
+      }
+    } catch (e) {
+      _showSnack('Error al escanear: $e. Verifica que tu celular esté en el Wi-Fi del satélite.', isError: true);
+    } finally {
+      setState(() => _isScanningAir = false);
+    }
+  }
+
+  void _selectNetworkForMesh(WirelessScanResult net) {
+    setState(() {
+      _selectedNetwork = net;
+      if (net.ssid != 'Red Oculta') {
+        _ssid24Controller.text = net.ssid;
+      }
+      if (net.channel > 14) {
+        _mainChannel5 = net.channel;
+        _mainBssid5 = net.mac;
+      } else {
+        _mainChannel24 = net.channel;
+        _mainBssid24 = net.mac;
+      }
+    });
+    _showSnack('Red "${net.ssid}" seleccionada (Canal ${net.channel})');
+  }
+
   // TAB 2: Aprovisionar Satélite desde el teléfono
   Future<void> _runProvisionSatellite() async {
     final satName = _addSatNameController.text.trim();
@@ -408,7 +461,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
 
     setState(() => _isProvisioningSat = true);
     try {
-      _showSnack('Conectando a satélite en 192.168.1.1 y aprovisionando como "$satName"...');
+      _showSnack('Conectando a satélite y configurando enlace Mesh WDS en $targetIp...');
       await RouterService.provisionSatelliteDirect(
         satIp: '192.168.1.1',
         satPassword: satPass,
@@ -417,6 +470,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         mainSsid: mainSsid,
         mainKey: mainKey,
         satName: satName,
+        channel5: _mainChannel5,
+        channel24: _mainChannel24,
+        mainBssid: _mainBssid5.isNotEmpty ? _mainBssid5 : (_selectedNetwork?.mac ?? ''),
       );
 
       // Si el satélite no estaba en la lista de nodos, agregarlo o actualizarlo
@@ -1201,6 +1257,102 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     ],
                   ),
                 ),
+              ],
+            ),
+          ),
+        ),
+
+        const SizedBox(height: 16),
+
+        // Card RF Scanner en el aire
+        Card(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Row(
+                      children: [
+                        Icon(Icons.radar, color: Color(0xFF60A5FA), size: 20),
+                        SizedBox(width: 8),
+                        Text('Detectar Router en el Aire', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+                      ],
+                    ),
+                    ElevatedButton.icon(
+                      onPressed: _isScanningAir ? null : _scanRfFromSatellite,
+                      icon: _isScanningAir
+                          ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                          : const Icon(Icons.refresh, size: 16),
+                      label: Text(_isScanningAir ? 'Buscando...' : 'Escanear RF'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF2563EB),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  'El satélite buscará las redes cercanas. Toca tu router principal para sincronizar canal y enlace WDS automáticamente:',
+                  style: TextStyle(fontSize: 11, color: Colors.grey),
+                ),
+                if (_detectedNetworks.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  ..._detectedNetworks.take(6).map((net) {
+                    final isSelected = _selectedNetwork?.mac == net.mac;
+                    final isMain = net.ssid == _ssid24Controller.text.trim();
+                    return InkWell(
+                      onTap: () => _selectNetworkForMesh(net),
+                      borderRadius: BorderRadius.circular(10),
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(vertical: 4),
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: isSelected ? const Color(0xFF1E3A8A) : const Color(0xFF0F172A),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: isSelected ? const Color(0xFF60A5FA) : (isMain ? const Color(0xFF10B981) : Colors.white12),
+                            width: isSelected || isMain ? 1.5 : 1.0,
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.wifi, color: isMain ? const Color(0xFF34D399) : (net.signal >= -65 ? Colors.greenAccent : Colors.orangeAccent), size: 20),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Text(net.ssid, style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 13)),
+                                      if (isMain) ...[
+                                        const SizedBox(width: 6),
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                          decoration: BoxDecoration(color: const Color(0xFF065F46), borderRadius: BorderRadius.circular(4)),
+                                          child: const Text('TU RED', style: TextStyle(fontSize: 9, color: Color(0xFF34D399), fontWeight: FontWeight.bold)),
+                                        ),
+                                      ],
+                                    ],
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text('Canal ${net.channel} • ${net.signal} dBm • BSSID: ${net.mac}', style: const TextStyle(fontSize: 10, color: Colors.grey)),
+                                ],
+                              ),
+                            ),
+                            if (isSelected) const Icon(Icons.check_circle, color: Color(0xFF60A5FA), size: 20),
+                          ],
+                        ),
+                      ),
+                    );
+                  }),
+                ],
               ],
             ),
           ),
