@@ -808,7 +808,7 @@ class RouterService {
     return results;
   }
 
-  /// Aprovisionamiento Guiado Directo del Satélite (Universal Bridge y Roaming 802.11r)
+  /// Aprovisionamiento Guiado Directo del Satélite (Híbrido: Universal Bridge + Wi-Fi Mesh + 802.11r)
   static Future<void> provisionSatelliteDirect({
     required String satIp,
     required String satPassword,
@@ -816,98 +816,75 @@ class RouterService {
     required String mainGateway,
     required String mainSsid,
     required String mainKey,
-    String connectionMode = 'cable',
+    String connectionMode = 'hybrid',
   }) async {
     // PASO 1: Desbloquear LuCI y arrancar Dropbear SSH en el satélite
     final unlocked = await unlockRouter(satIp, satPassword);
     if (!unlocked) {
-      throw Exception('No se pudo desbloquear el satélite en $satIp. Verifica que estés conectado a su red Wi-Fi o cable y que la clave de etiqueta sea correcta.');
+      throw Exception('No se pudo desbloquear el satélite en $satIp. Verifica que tu teléfono esté conectado a su red Wi-Fi o cable y que la clave de etiqueta sea correcta.');
     }
     await Future.delayed(const Duration(seconds: 3));
 
-    String script = '';
+    // PASO 2: Configuración híbrida completa (Puertos unificados en Switch + Wi-Fi Backhaul + Roaming 802.11r)
+    final script = '''
+      # 1. Unificar puertos WAN (eth1) y LAN (eth0) en br-lan (Switch transparente sin bloqueo)
+      uci -q delete network.wan
+      uci -q delete network.wan6
+      uci -q set network.lan.ifname='eth0 eth1'
+      uci -q set network.lan.type='bridge'
 
-    if (connectionMode == 'cable') {
-      script = '''
-        uci -q delete network.wan
-        uci -q delete network.wan6
-        uci -q set network.lan.ifname='eth0 eth1'
-        uci -q set network.lan.type='bridge'
+      # 2. Configurar IP fija final y Puerta de enlace al Router Principal
+      uci set network.lan.ipaddr='$targetIp'
+      uci set network.lan.netmask='255.255.255.0'
+      uci set network.lan.gateway='$mainGateway'
+      uci -q delete network.lan.dns
+      uci add_list network.lan.dns='$mainGateway'
+      uci commit network
 
-        uci set network.lan.ipaddr='$targetIp'
-        uci set network.lan.netmask='255.255.255.0'
-        uci set network.lan.gateway='$mainGateway'
-        uci -q delete network.lan.dns
-        uci add_list network.lan.dns='$mainGateway'
-        uci commit network
+      # 3. Apagar Servidor DHCP y dnsmasq para evitar conflictos de IP
+      uci set dhcp.lan.ignore='1'
+      uci commit dhcp
+      /etc/init.d/dnsmasq stop 2>/dev/null || true
+      /etc/init.d/dnsmasq disable 2>/dev/null || true
 
-        uci set dhcp.lan.ignore='1'
-        uci commit dhcp
-        /etc/init.d/dnsmasq stop 2>/dev/null || true
-        /etc/init.d/dnsmasq disable 2>/dev/null || true
+      # 4. Clonar emisión Wi-Fi con Fast Roaming 802.11r (misma red y contraseña)
+      for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
+        ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
+        ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
+        uci set wireless.\${iface}.encryption='psk2'
+        uci set wireless.\${iface}.disabled='0'
+        uci set wireless.\${iface}.ieee80211r='1'
+        uci set wireless.\${iface}.mobility_domain='4f54'
+        uci set wireless.\${iface}.ft_over_ds='0'
+        uci set wireless.\${iface}.ft_psk_generate_local='1'
+      done
 
-        for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
-          ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
-          ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
-          uci set wireless.\${iface}.encryption='psk2'
-          uci set wireless.\${iface}.disabled='0'
-          uci set wireless.\${iface}.ieee80211r='1'
-          uci set wireless.\${iface}.mobility_domain='4f54'
-          uci set wireless.\${iface}.ft_over_ds='0'
-          uci set wireless.\${iface}.ft_psk_generate_local='1'
-        done
-        uci commit wireless
+      # 5. Configurar enlace cliente inalámbrico de retorno (Mesh STA Backhaul)
+      ${(mainSsid.isNotEmpty && mainKey.isNotEmpty) ? """
+      uci -q delete wireless.mesh_sta
+      uci set wireless.mesh_sta=wifi-iface
+      uci set wireless.mesh_sta.device='radio1'
+      uci set wireless.mesh_sta.mode='sta'
+      uci set wireless.mesh_sta.network='lan'
+      uci set wireless.mesh_sta.ssid='$mainSsid'
+      uci set wireless.mesh_sta.key='$mainKey'
+      uci set wireless.mesh_sta.encryption='psk2'
+      """ : ""}
+      uci commit wireless
 
-        /etc/init.d/minim stop 2>/dev/null || true
-        /etc/init.d/minim disable 2>/dev/null || true
-        /etc/init.d/network restart &
-        wifi reload 2>/dev/null || wifi 2>/dev/null || true
-      ''';
-    } else {
-      script = '''
-        uci set network.lan.ipaddr='$targetIp'
-        uci set network.lan.netmask='255.255.255.0'
-        uci set network.lan.gateway='$mainGateway'
-        uci -q delete network.lan.dns
-        uci add_list network.lan.dns='$mainGateway'
-        uci commit network
-
-        uci set dhcp.lan.ignore='1'
-        uci commit dhcp
-        /etc/init.d/dnsmasq stop 2>/dev/null || true
-        /etc/init.d/dnsmasq disable 2>/dev/null || true
-
-        for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
-          ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
-          ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
-          uci set wireless.\${iface}.encryption='psk2'
-          uci set wireless.\${iface}.disabled='0'
-          uci set wireless.\${iface}.ieee80211r='1'
-          uci set wireless.\${iface}.mobility_domain='4f54'
-        done
-
-        uci -q delete wireless.mesh_sta
-        uci set wireless.mesh_sta=wifi-iface
-        uci set wireless.mesh_sta.device='radio1'
-        uci set wireless.mesh_sta.mode='sta'
-        uci set wireless.mesh_sta.network='lan'
-        uci set wireless.mesh_sta.ssid='$mainSsid'
-        uci set wireless.mesh_sta.key='$mainKey'
-        uci set wireless.mesh_sta.encryption='psk2'
-        uci commit wireless
-
-        /etc/init.d/minim stop 2>/dev/null || true
-        /etc/init.d/minim disable 2>/dev/null || true
-        /etc/init.d/network restart &
-        wifi reload 2>/dev/null || wifi 2>/dev/null || true
-      ''';
-    }
+      # 6. Desactivar Minim y aplicar cambios de red
+      /etc/init.d/minim stop 2>/dev/null || true
+      /etc/init.d/minim disable 2>/dev/null || true
+      /etc/init.d/network restart &
+      wifi reload 2>/dev/null || wifi 2>/dev/null || true
+    ''';
 
     try {
       await executeSSH(satIp, satPassword, script);
     } catch (_) {
-      // Al reiniciar la interfaz de red con la nueva IP, la sesión SSH se cierra normalmente
+      // El cambio de IP desconecta la sesión SSH normalmente
     }
+  }
   }
   }
 
