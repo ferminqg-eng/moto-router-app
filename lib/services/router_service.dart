@@ -53,8 +53,20 @@ class DhcpConfigData {
   int start;
   int limit;
   String dns;
+  bool dhcpEnabled;
+  String lanIp;
+  String netmask;
+  String gateway;
 
-  DhcpConfigData({this.start = 100, this.limit = 150, this.dns = '1.1.1.1,1.0.0.1'});
+  DhcpConfigData({
+    this.start = 100,
+    this.limit = 150,
+    this.dns = '1.1.1.1,1.0.0.1',
+    this.dhcpEnabled = true,
+    this.lanIp = '192.168.1.1',
+    this.netmask = '255.255.255.0',
+    this.gateway = '',
+  });
 }
 
 class SatelliteQuality {
@@ -451,17 +463,21 @@ class RouterService {
     await executeSSH(satIp, satPassword, script);
   }
 
-  /// Lee configuración actual de DHCP y DNS
+  /// Lee configuración actual de DHCP, DNS e IP de LAN
   static Future<DhcpConfigData> getDhcpConfig(String ip, String password) async {
     const script = '''
       echo "===START===" && uci -q get dhcp.lan.start || echo "100"
       echo "===LIMIT===" && uci -q get dhcp.lan.limit || echo "150"
       echo "===DNS===" && uci -q get network.lan.dns || echo "1.1.1.1 1.0.0.1"
+      echo "===IGNORE===" && uci -q get dhcp.lan.ignore || echo "0"
+      echo "===LAN_IP===" && uci -q get network.lan.ipaddr || echo ""
+      echo "===NETMASK===" && uci -q get network.lan.netmask || echo "255.255.255.0"
+      echo "===GATEWAY===" && uci -q get network.lan.gateway || echo ""
     ''';
 
     final output = await executeSSH(ip, password, script);
     final parts = output.split('===');
-    final data = DhcpConfigData();
+    final data = DhcpConfigData(lanIp: ip);
 
     for (int i = 1; i < parts.length; i += 2) {
       final tag = parts[i].trim();
@@ -470,18 +486,32 @@ class RouterService {
       if (tag == 'START') data.start = int.tryParse(val) ?? 100;
       if (tag == 'LIMIT') data.limit = int.tryParse(val) ?? 150;
       if (tag == 'DNS') data.dns = val.replaceAll(' ', ',');
+      if (tag == 'IGNORE') data.dhcpEnabled = (val != '1');
+      if (tag == 'LAN_IP' && val.isNotEmpty) data.lanIp = val.split('\n').first.trim();
+      if (tag == 'NETMASK' && val.isNotEmpty) data.netmask = val.split('\n').first.trim();
+      if (tag == 'GATEWAY' && val.isNotEmpty) data.gateway = val.split('\n').first.trim();
     }
 
     return data;
   }
 
-  /// Guarda DHCP y DNS
+  /// Guarda DHCP (activar/apagar, rango) y DNS
   static Future<void> saveDhcpConfig(String ip, String password, DhcpConfigData cfg) async {
-    final commands = <String>[
-      "uci set dhcp.lan.start='${cfg.start}'",
-      "uci set dhcp.lan.limit='${cfg.limit}'",
-      "uci commit dhcp",
-    ];
+    final commands = <String>[];
+
+    if (cfg.dhcpEnabled) {
+      commands.add("uci set dhcp.lan.ignore='0'");
+      commands.add("uci set dhcp.lan.start='${cfg.start}'");
+      commands.add("uci set dhcp.lan.limit='${cfg.limit}'");
+      commands.add("uci commit dhcp");
+      commands.add("/etc/init.d/dnsmasq enable 2>/dev/null || true");
+      commands.add("/etc/init.d/dnsmasq restart");
+    } else {
+      commands.add("uci set dhcp.lan.ignore='1'");
+      commands.add("uci commit dhcp");
+      commands.add("/etc/init.d/dnsmasq stop 2>/dev/null || true");
+      commands.add("/etc/init.d/dnsmasq disable 2>/dev/null || true");
+    }
 
     if (cfg.dns.isNotEmpty) {
       commands.add("uci -q delete network.lan.dns");
@@ -494,8 +524,74 @@ class RouterService {
       commands.add("uci commit network");
     }
 
-    commands.add("/etc/init.d/dnsmasq restart");
     await executeSSH(ip, password, commands.join('\n'));
+  }
+
+  /// Guarda la dirección IP de LAN, máscara de subred y Gateway
+  static Future<void> saveLanIpConfig(String ip, String password, {
+    required String newIp,
+    required String netmask,
+    String gateway = '',
+    String dns = '',
+  }) async {
+    final commands = <String>[
+      "uci set network.lan.ipaddr='$newIp'",
+      "uci set network.lan.netmask='$netmask'",
+    ];
+
+    if (gateway.isNotEmpty) {
+      commands.add("uci set network.lan.gateway='$gateway'");
+    } else {
+      commands.add("uci -q delete network.lan.gateway");
+    }
+
+    if (dns.isNotEmpty) {
+      commands.add("uci -q delete network.lan.dns");
+      for (var d in dns.split(',')) {
+        final clean = d.trim();
+        if (clean.isNotEmpty) {
+          commands.add("uci add_list network.lan.dns='$clean'");
+        }
+      }
+    }
+
+    commands.add("uci commit network");
+    commands.add("/etc/init.d/network restart &");
+
+    try {
+      await executeSSH(ip, password, commands.join('\n'));
+    } catch (_) {
+      // Al reiniciar la interfaz de red, el SSH corta la conexión, lo cual es esperado
+    }
+  }
+
+  /// Modo Satélite / Punto de Acceso asistido:
+  /// Apaga DHCP y fija IP estática (ej: 192.168.1.2) con Gateway apuntando al Router Principal
+  static Future<void> convertToAccessPoint(String ip, String password, {
+    required String satIp,
+    required String mainGateway,
+  }) async {
+    final script = '''
+      uci set network.lan.ipaddr='$satIp'
+      uci set network.lan.netmask='255.255.255.0'
+      uci set network.lan.gateway='$mainGateway'
+      uci -q delete network.lan.dns
+      uci add_list network.lan.dns='$mainGateway'
+      uci commit network
+
+      uci set dhcp.lan.ignore='1'
+      uci commit dhcp
+      /etc/init.d/dnsmasq stop 2>/dev/null || true
+      /etc/init.d/dnsmasq disable 2>/dev/null || true
+
+      /etc/init.d/minim stop 2>/dev/null || true
+      /etc/init.d/minim disable 2>/dev/null || true
+
+      /etc/init.d/network restart &
+    ''';
+    try {
+      await executeSSH(ip, password, script);
+    } catch (_) {}
   }
 
   /// Agrega regla de Port Forwarding
