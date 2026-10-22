@@ -22,7 +22,7 @@ class MotoRouterApp extends StatelessWidget {
           secondary: Color(0xFF6366F1),
           surface: Color(0xFF1E293B),
         ),
-        cardTheme: CardTheme(
+        cardTheme: CardThemeData(
           color: const Color(0xFF1E293B),
           elevation: 2,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
