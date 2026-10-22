@@ -463,24 +463,6 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       setState(() => _isLoading = false);
     }
   }
-        satIp: targetIp,
-        mainGateway: gateway,
-      );
-
-      _showSnack('¡Listo! Satélite configurado. Ya puedes conectar el cable LAN a LAN.');
-      setState(() {
-        _currentIp = targetIp;
-        _ipController.text = targetIp;
-        _dhcpEnabled = false;
-        _lanIpController.text = targetIp;
-        _lanGatewayController.text = gateway;
-      });
-    } catch (e) {
-      _showSnack('Error al aplicar modo satélite: $e', isError: true);
-    } finally {
-      setState(() => _isLoading = false);
-    }
-  }
 
   Future<void> _addPortForward() async {
     final name = _pfNameController.text.trim();
