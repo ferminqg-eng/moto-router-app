@@ -557,17 +557,6 @@ class RouterService {
     }
   }
 
-    // 6. Commit y reinicio del subsistema wireless
-    commands.add('uci commit wireless');
-    commands.add('(wifi down 2>/dev/null; sleep 1; wifi up 2>/dev/null; /etc/init.d/network restart 2>/dev/null) &');
-
-    try {
-      await executeSSH(ip, password, commands.join('\n'));
-    } catch (_) {
-      // El reinicio de la interfaz de red cierra la sesión SSH normalmente
-    }
-  }
-
   /// Mide la calidad de conexión entre el router principal y un satélite
   static Future<SatelliteQuality> checkSatelliteQuality(String mainIp, String mainPassword, String satIp) async {
     final script = '''
@@ -1109,13 +1098,6 @@ EOF
       (/etc/init.d/network restart) &
       (sleep 2 && wifi down && sleep 1 && wifi up) &
     ''';
-
-    try {
-      await executeSSH(satIp, satPassword, script);
-    } catch (_) {
-      // El cambio de IP desconecta la sesión SSH normalmente
-    }
-  }
 
     try {
       await executeSSH(satIp, satPassword, script);
