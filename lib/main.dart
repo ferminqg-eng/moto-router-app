@@ -22,10 +22,33 @@ class MotoRouterApp extends StatelessWidget {
           secondary: Color(0xFF6366F1),
           surface: Color(0xFF1E293B),
         ),
+        cardTheme: CardTheme(
+          color: const Color(0xFF1E293B),
+          elevation: 2,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        ),
       ),
       home: const MainNavigationScreen(),
     );
   }
+}
+
+class MeshNode {
+  String name;
+  String ip;
+  String password;
+  int txPower;
+  SatelliteQuality? quality;
+  bool isChecking;
+
+  MeshNode({
+    required this.name,
+    required this.ip,
+    this.password = '',
+    this.txPower = 23,
+    this.quality,
+    this.isChecking = false,
+  });
 }
 
 class MainNavigationScreen extends StatefulWidget {
@@ -43,13 +66,14 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   int _currentIndex = 0;
   bool _isLoading = false;
 
-  // Controllers Login
+  // Login
   final TextEditingController _ipController = TextEditingController(text: '192.168.1.1');
   final TextEditingController _passController = TextEditingController();
 
-  // Wi-Fi State
+  // Tab 1: Router Principal & Wi-Fi State
+  final TextEditingController _routerNameController = TextEditingController(text: 'Router Principal');
   bool _separateBands = false;
-  final TextEditingController _ssid24Controller = TextEditingController();
+  final TextEditingController _ssid24Controller = TextEditingController(text: 'LanRouterWiFi');
   final TextEditingController _key24Controller = TextEditingController();
   String _enc24 = 'psk2';
 
@@ -58,7 +82,8 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   String _enc5 = 'psk2';
 
   int _txPower = 23; // 23 = Max (100%), 20 = Alta (75%), 17 = Media (50%), 14 = Baja (25%)
-  bool _legacyMode = false; // Compatibilidad con dispositivos sin Wi-Fi 6
+  bool _legacyMode = false; // Compatibilidad con clientes sin Wi-Fi 6 en 2.4 GHz
+  bool _isPassObscure = true;
 
   // Red LAN & DHCP State
   bool _dhcpEnabled = true;
@@ -69,52 +94,22 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   final TextEditingController _dhcpLimitController = TextEditingController(text: '150');
   String _selectedDns = '1.1.1.1,1.0.0.1';
 
-  // Port Forward State
-  final TextEditingController _pfNameController = TextEditingController();
-  final TextEditingController _pfExtPortController = TextEditingController();
-  final TextEditingController _pfIntIpController = TextEditingController();
-  final TextEditingController _pfIntPortController = TextEditingController();
-  String _pfProto = 'tcp udp';
+  // Tab 2: Agregar Satélites State
+  final TextEditingController _addSatNameController = TextEditingController(text: 'Equipo Sala');
+  final TextEditingController _addSatPassController = TextEditingController();
+  String _addSatPresetIp = '192.168.1.2';
+  bool _addSatPassObscure = true;
+  bool _isProvisioningSat = false;
 
-  // Mesh Satellites State
-  final TextEditingController _sat2CurrentIpController = TextEditingController(text: '192.168.1.147');
-  final TextEditingController _sat2TargetIpController = TextEditingController(text: '192.168.1.2');
-  final TextEditingController _sat2PassController = TextEditingController();
-  int _sat2TxPower = 23;
-  SatelliteQuality? _sat2Quality;
-  bool _checkingSat2 = false;
-  bool _sat2PassObscure = true;
-
-  final TextEditingController _sat3CurrentIpController = TextEditingController(text: '192.168.1.3');
-  final TextEditingController _sat3TargetIpController = TextEditingController(text: '192.168.1.3');
-  final TextEditingController _sat3PassController = TextEditingController();
-  int _sat3TxPower = 23;
-  SatelliteQuality? _sat3Quality;
-  bool _checkingSat3 = false;
-  bool _sat3PassObscure = true;
-
-  // WPS & RF State
-  bool _isWpsActive = false;
-  int _wpsSecondsLeft = 0;
-  Timer? _wpsTimer;
-  bool _isScanningAir = false;
-  List<WirelessScanResult> _airScanResults = [];
-
-  // Guided Provisioning State
-  String _provSelectedSat = 'sat2'; // 'sat2' -> 192.168.1.2, 'sat3' -> 192.168.1.3
-  final TextEditingController _provSatIpController = TextEditingController(text: '192.168.1.1');
-  final TextEditingController _provSatPassController = TextEditingController();
-  final TextEditingController _provSsidController = TextEditingController();
-  final TextEditingController _provKeyController = TextEditingController();
-  String _provConnMode = 'cable'; // 'cable' o 'wireless'
-  bool _isProvPassObscure = true;
-  bool _isProvisioning = false;
-
-  // Site Survey State
-  bool _isScanningMesh = false;
-  bool _showAllSurveyClients = false;
+  // Tab 3: Control de Satélites Mesh State
+  final List<MeshNode> _meshNodes = [
+    MeshNode(name: 'Equipo Sala', ip: '192.168.1.2'),
+    MeshNode(name: 'Equipo Habitación', ip: '192.168.1.3'),
+  ];
+  bool _isCheckingAllNodes = false;
 
   void _showSnack(String msg, {bool isError = false}) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(msg, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500)),
@@ -124,29 +119,12 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     );
   }
 
-  void _autoDetectSatellites(List<ConnectedClient> clients) {
-    final satCandidates = clients.where((c) {
-      final name = c.name.toUpperCase();
-      final mac = c.mac.toLowerCase();
-      final isMoto = name.contains('MH') || name.contains('MOTO') || 
-                     mac.startsWith('c8:c7:50') || mac.startsWith('00:0c:e7') || mac.startsWith('14:59:c0');
-      return isMoto && c.ip != _currentIp;
-    }).toList();
-
-    if (satCandidates.isNotEmpty) {
-      _sat2CurrentIpController.text = satCandidates[0].ip;
-      if (satCandidates.length > 1) {
-        _sat3CurrentIpController.text = satCandidates[1].ip;
-      }
-    }
-  }
-
-  // Login y desbloqueo automático
+  // Login y desbloqueo automático en Router Principal
   Future<void> _login() async {
     final ip = _ipController.text.trim();
     final pass = _passController.text.trim();
     if (ip.isEmpty || pass.isEmpty) {
-      return _showSnack('Ingresa IP y Contraseña', isError: true);
+      return _showSnack('Ingresa IP y Contraseña del router', isError: true);
     }
 
     setState(() => _isLoading = true);
@@ -163,7 +141,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         _currentIp = ip;
         _currentPassword = pass;
         _status = status;
-        _autoDetectSatellites(status.clients);
+        _routerNameController.text = status.hostname;
       });
 
       _loadWifiConfig();
@@ -181,13 +159,13 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       final wifi = await RouterService.getWifiConfig(_currentIp, _currentPassword);
       setState(() {
         _separateBands = wifi.separateBands;
-        _ssid24Controller.text = wifi.ssid24;
-        _key24Controller.text = wifi.key24;
-        _enc24 = wifi.enc24;
+        if (wifi.ssid24.isNotEmpty) _ssid24Controller.text = wifi.ssid24;
+        if (wifi.key24.isNotEmpty) _key24Controller.text = wifi.key24;
+        _enc24 = wifi.enc24.isNotEmpty ? wifi.enc24 : 'psk2';
 
-        _ssid5Controller.text = wifi.ssid5;
-        _key5Controller.text = wifi.key5;
-        _enc5 = wifi.enc5;
+        if (wifi.ssid5.isNotEmpty) _ssid5Controller.text = wifi.ssid5;
+        if (wifi.key5.isNotEmpty) _key5Controller.text = wifi.key5;
+        _enc5 = wifi.enc5.isNotEmpty ? wifi.enc5 : 'psk2';
 
         _txPower = wifi.txPower;
         _legacyMode = wifi.legacyMode;
@@ -210,6 +188,39 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     } catch (_) {}
   }
 
+  // Guardar Nombre del Equipo (Hostname)
+  Future<void> _saveRouterName() async {
+    final name = _routerNameController.text.trim();
+    if (name.isEmpty) return _showSnack('Ingresa un nombre para el equipo', isError: true);
+    setState(() => _isLoading = true);
+    try {
+      await RouterService.setHostname(_currentIp, _currentPassword, name);
+      _showSnack('Nombre del router actualizado a "$name"');
+      final s = await RouterService.getStatus(_currentIp, _currentPassword);
+      setState(() => _status = s);
+    } catch (e) {
+      _showSnack('Error al cambiar nombre: $e', isError: true);
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  // Apagar Minim Cloud
+  Future<void> _disableMinimCloud() async {
+    setState(() => _isLoading = true);
+    try {
+      await RouterService.disableMinim(_currentIp, _currentPassword);
+      _showSnack('Agente Minim en la nube DESACTIVADO. El router opera 100% local');
+      final s = await RouterService.getStatus(_currentIp, _currentPassword);
+      setState(() => _status = s);
+    } catch (e) {
+      _showSnack('Error al apagar Minim: $e', isError: true);
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  // Guardar Wi-Fi
   Future<void> _saveWifi() async {
     setState(() => _isLoading = true);
     try {
@@ -226,7 +237,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       );
 
       await RouterService.saveWifiConfig(_currentIp, _currentPassword, cfg);
-      _showSnack('Wi-Fi, Cifrado y Potencia actualizados correctamente');
+      _showSnack('Wi-Fi, Cifrado y Potencia aplicados. Reiniciando radios...');
     } catch (e) {
       _showSnack('Error al guardar Wi-Fi: $e', isError: true);
     } finally {
@@ -234,6 +245,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     }
   }
 
+  // Guardar DHCP
   Future<void> _saveDhcp() async {
     setState(() => _isLoading = true);
     try {
@@ -245,8 +257,8 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       );
       await RouterService.saveDhcpConfig(_currentIp, _currentPassword, cfg);
       _showSnack(_dhcpEnabled
-          ? 'Servidor DHCP activado y guardado correctamente'
-          : 'Servidor DHCP APAGADO (este satélite ya no causará colisiones en LAN a LAN)');
+          ? 'Servidor DHCP guardado y activado'
+          : 'Servidor DHCP APAGADO correctamente');
     } catch (e) {
       _showSnack('Error al guardar DHCP: $e', isError: true);
     } finally {
@@ -254,6 +266,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     }
   }
 
+  // Guardar IP LAN
   Future<void> _saveLanIp() async {
     final newIp = _lanIpController.text.trim();
     final netmask = _lanNetmaskController.text.trim();
@@ -269,8 +282,8 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         backgroundColor: const Color(0xFF1E293B),
         title: const Text('¿Cambiar IP LAN del router?', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
         content: Text(
-          'El router cambiará su IP local a $newIp y reiniciará su red.\n\n'
-          'Si cambias la IP, deberás reconectar la app a la nueva dirección: $newIp',
+          'El router cambiará su IP a $newIp y reiniciará su red.\n\n'
+          'Deberás reconectar la app a la nueva dirección: $newIp',
           style: const TextStyle(color: Colors.white70, fontSize: 13),
         ),
         actions: [
@@ -305,482 +318,211 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       await Future.delayed(const Duration(seconds: 4));
       await _login();
     } catch (e) {
-      _showSnack('IP guardada. Por favor conéctate a $newIp si se desconectó la sesión.');
+      _showSnack('IP guardada. Por favor conéctate a $newIp.');
     } finally {
       setState(() => _isLoading = false);
     }
   }
 
-  Future<void> _applySatelliteApModeDialog() async {
-    final satIpCtrl = TextEditingController(text: '192.168.1.2');
-    final gwCtrl = TextEditingController(text: '192.168.1.1');
-    String selectedPreset = '192.168.1.2';
-
-    final proceed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) {
-          return AlertDialog(
-            backgroundColor: const Color(0xFF1E293B),
-            title: const Row(
-              children: [
-                Icon(Icons.hub, color: Color(0xFF38BDF8)),
-                SizedBox(width: 8),
-                Expanded(
-                  child: Text('Modo Satélite / AP (Cable LAN a LAN)', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-                ),
-              ],
-            ),
-            content: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Prepara este equipo para operar como satélite interconectado por cable:\n\n'
-                    '1. Apaga el servidor DHCP (elimina choques de IP con el principal).\n'
-                    '2. Fija su IP en la misma subred (ej: 192.168.1.2 para Satélite 2, 192.168.1.3 para Satélite 3).\n'
-                    '3. Enlaza la puerta de enlace al router principal (192.168.1.1).\n\n'
-                    'Selecciona qué satélite estás configurando:',
-                    style: TextStyle(color: Colors.white70, fontSize: 12),
-                  ),
-                  const SizedBox(height: 12),
-
-                  // Selector rápido de nodo satélite
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 6,
-                    children: [
-                      ChoiceChip(
-                        label: const Text('Satélite 2 (192.168.1.2)'),
-                        selected: selectedPreset == '192.168.1.2',
-                        selectedColor: const Color(0xFF0284C7),
-                        backgroundColor: const Color(0xFF0F172A),
-                        labelStyle: TextStyle(
-                          color: selectedPreset == '192.168.1.2' ? Colors.white : Colors.white70,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                        ),
-                        onSelected: (val) {
-                          if (val) {
-                            setDialogState(() {
-                              selectedPreset = '192.168.1.2';
-                              satIpCtrl.text = '192.168.1.2';
-                            });
-                          }
-                        },
-                      ),
-                      ChoiceChip(
-                        label: const Text('Satélite 3 (192.168.1.3)'),
-                        selected: selectedPreset == '192.168.1.3',
-                        selectedColor: const Color(0xFF6366F1),
-                        backgroundColor: const Color(0xFF0F172A),
-                        labelStyle: TextStyle(
-                          color: selectedPreset == '192.168.1.3' ? Colors.white : Colors.white70,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                        ),
-                        onSelected: (val) {
-                          if (val) {
-                            setDialogState(() {
-                              selectedPreset = '192.168.1.3';
-                              satIpCtrl.text = '192.168.1.3';
-                            });
-                          }
-                        },
-                      ),
-                      ChoiceChip(
-                        label: const Text('Satélite 4 (192.168.1.4)'),
-                        selected: selectedPreset == '192.168.1.4',
-                        selectedColor: const Color(0xFF0D9488),
-                        backgroundColor: const Color(0xFF0F172A),
-                        labelStyle: TextStyle(
-                          color: selectedPreset == '192.168.1.4' ? Colors.white : Colors.white70,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                        ),
-                        onSelected: (val) {
-                          if (val) {
-                            setDialogState(() {
-                              selectedPreset = '192.168.1.4';
-                              satIpCtrl.text = '192.168.1.4';
-                            });
-                          }
-                        },
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 14),
-
-                  TextField(
-                    controller: satIpCtrl,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: const InputDecoration(
-                      labelText: 'IP Estática para este Satélite',
-                      hintText: '192.168.1.2',
-                      border: OutlineInputBorder(),
-                    ),
-                    onChanged: (val) {
-                      setDialogState(() {
-                        selectedPreset = val.trim();
-                      });
-                    },
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: gwCtrl,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: const InputDecoration(
-                      labelText: 'IP del Router Principal (Gateway)',
-                      hintText: '192.168.1.1',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0284C7)),
-                onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('Aplicar y Apagar DHCP', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-              ),
-            ],
-          );
-        },
-      ),
-    );
-
-    if (proceed != true) return;
-
-    setState(() => _isLoading = true);
-    try {
-      final targetIp = satIpCtrl.text.trim();
-      final gateway = gwCtrl.text.trim();
-
-      _showSnack('Configurando satélite: apagando DHCP y fijando IP $targetIp...');
-      await RouterService.convertToAccessPoint(
-        _currentIp,
-        _currentPassword,
-        satIp: targetIp,
-        mainGateway: gateway,
-      );
-
-      _showSnack('¡Listo! Satélite configurado en $targetIp. Conecta el cable LAN a LAN.');
-      setState(() {
-        _currentIp = targetIp;
-        _ipController.text = targetIp;
-        _dhcpEnabled = false;
-        _lanIpController.text = targetIp;
-        _lanGatewayController.text = gateway;
-      });
-    } catch (e) {
-      _showSnack('Error al aplicar modo satélite: $e', isError: true);
-    } finally {
-      setState(() => _isLoading = false);
-    }
-  }
-
-  Future<void> _addPortForward() async {
-    final name = _pfNameController.text.trim();
-    final extPort = _pfExtPortController.text.trim();
-    final intIp = _pfIntIpController.text.trim();
-    final intPort = _pfIntPortController.text.trim().isEmpty ? extPort : _pfIntPortController.text.trim();
-
-    if (name.isEmpty || extPort.isEmpty || intIp.isEmpty) {
-      return _showSnack('Completa los campos del puerto', isError: true);
-    }
-
-    setState(() => _isLoading = true);
-    try {
-      await RouterService.addPortForward(
-        _currentIp,
-        _currentPassword,
-        name: name,
-        proto: _pfProto,
-        extPort: extPort,
-        intIp: intIp,
-        intPort: intPort,
-      );
-      _showSnack('Regla de puerto $extPort agregada al firewall');
-      _pfNameController.clear();
-      _pfExtPortController.clear();
-    } catch (e) {
-      _showSnack('Error agregando regla: $e', isError: true);
-    } finally {
-      setState(() => _isLoading = false);
-    }
-  }
-
-  @override
-  void dispose() {
-    _wpsTimer?.cancel();
-    super.dispose();
-  }
-
-  // Emparejamiento inalámbrico WPS (Push Button Connect)
-  Future<void> _startWpsPairing() async {
-    setState(() => _isLoading = true);
-    try {
-      final ok = await RouterService.triggerWps(_currentIp, _currentPassword);
-      if (!ok) {
-        _showSnack('No se pudo activar WPS en el router principal', isError: true);
-        return;
-      }
-
-      setState(() {
-        _isWpsActive = true;
-        _wpsSecondsLeft = 120;
-      });
-
-      _showSnack('WPS activado por 2 minutos. Enciende tu satélite para vincularlo.');
-
-      _wpsTimer?.cancel();
-      _wpsTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
-        if (!mounted) {
-          timer.cancel();
-          return;
-        }
-
-        if (_wpsSecondsLeft <= 1) {
-          timer.cancel();
-          setState(() {
-            _isWpsActive = false;
-            _wpsSecondsLeft = 0;
-          });
-          _showSnack('Ventana de emparejamiento WPS finalizada.');
-          return;
-        }
-
-        setState(() {
-          _wpsSecondsLeft--;
-        });
-
-        // Cada 6 segundos consulta si un nuevo dispositivo se asoció
-        if (_wpsSecondsLeft % 6 == 0) {
-          try {
-            final st = await RouterService.getStatus(_currentIp, _currentPassword);
-            if (st.clients.length > (_status?.clients.length ?? 0)) {
-              setState(() {
-                _status = st;
-                _autoDetectSatellites(st.clients);
-              });
-              _showSnack('¡Nuevo satélite detectado y asociado a la malla!');
-            }
-          } catch (_) {}
-        }
-      });
-    } catch (e) {
-      _showSnack('Error al activar WPS: $e', isError: true);
-    } finally {
-      setState(() => _isLoading = false);
-    }
-  }
-
-  void _cancelWps() {
-    _wpsTimer?.cancel();
-    setState(() {
-      _isWpsActive = false;
-      _wpsSecondsLeft = 0;
-    });
-    _showSnack('Emparejamiento WPS cancelado');
-  }
-
-  // Escaneo aéreo RF real
-  Future<void> _scanWirelessAir() async {
-    setState(() => _isScanningAir = true);
-    try {
-      final results = await RouterService.scanWirelessAir(_currentIp, _currentPassword);
-      setState(() {
-        _airScanResults = results;
-      });
-      final motoCount = results.where((r) => r.isMotorola).length;
-      _showSnack('Escaneo aéreo completado: ${results.length} señales ($motoCount nodos Motorola)');
-    } catch (e) {
-      _showSnack('Error en escaneo aéreo: $e', isError: true);
-    } finally {
-      setState(() => _isScanningAir = false);
-    }
-  }
-
-  // Escaneo interactivo de Satélites Mesh (Site Survey)
-  Future<void> _scanMeshNodes() async {
-    setState(() => _isScanningMesh = true);
-    try {
-      final status = await RouterService.getStatus(_currentIp, _currentPassword);
-      setState(() {
-        _status = status;
-        _autoDetectSatellites(status.clients);
-      });
-      _showSnack('Radar Mesh: ${status.clients.length} dispositivos detectados');
-    } catch (e) {
-      _showSnack('Error al escanear dispositivos: $e', isError: true);
-    } finally {
-      setState(() => _isScanningMesh = false);
-    }
-  }
-
-  // Comprobar calidad de satélite
-  Future<void> _checkQuality(String satIp, bool isSat2) async {
-    if (satIp.isEmpty) {
-      return _showSnack('Ingresa la IP del satélite a comprobar', isError: true);
-    }
-    setState(() {
-      if (isSat2) _checkingSat2 = true;
-      else _checkingSat3 = true;
-    });
-
-    try {
-      final q = await RouterService.checkSatelliteQuality(_currentIp, _currentPassword, satIp);
-      setState(() {
-        if (isSat2) _sat2Quality = q;
-        else _sat3Quality = q;
-      });
-      _showSnack('Diagnóstico completado para $satIp: ${q.statusText}');
-    } catch (e) {
-      _showSnack('Error midiendo calidad en $satIp: $e', isError: true);
-    } finally {
-      setState(() {
-        if (isSat2) _checkingSat2 = false;
-        else _checkingSat3 = false;
-      });
-    }
-  }
-
-  // Ajustar potencia satélite
-  Future<void> _applySatellitePower(String satIp, String satPassword, int txPower) async {
-    if (satPassword.isEmpty) {
-      return _showSnack('Ingresa la contraseña del satélite primero', isError: true);
-    }
-
-    setState(() => _isLoading = true);
-    try {
-      await RouterService.setSatelliteTxPower(satIp, satPassword, txPower);
-      _showSnack('Potencia de transmisión ($txPower dBm) aplicada en $satIp');
-    } catch (e) {
-      _showSnack('Error aplicando potencia: $e', isError: true);
-    } finally {
-      setState(() => _isLoading = false);
-    }
-  }
-
-  Future<void> _setupSatellite({
-    required String currentIp,
-    required String targetIp,
-    required String satPassword,
-    required int txPower,
-    required bool isSat2,
-  }) async {
-    if (satPassword.isEmpty) {
-      return _showSnack('Ingresa la contraseña de la etiqueta del satélite', isError: true);
-    }
-    if (currentIp.isEmpty || targetIp.isEmpty) {
-      return _showSnack('Debes especificar la IP actual y la IP estática final', isError: true);
-    }
-
-    setState(() => _isLoading = true);
-    try {
-      _showSnack('Paso 1/3: Desbloqueando satélite en $currentIp...');
-      await RouterService.unlockRouter(currentIp, satPassword);
-      await Future.delayed(const Duration(seconds: 2));
-
-      _showSnack('Paso 2/3: Sincronizando Wi-Fi y configurando red mesh...');
-      final ssid = _ssid24Controller.text.trim().isNotEmpty
-          ? _ssid24Controller.text.trim()
-          : 'LanRouterWiFi';
-      final key = _key24Controller.text.trim();
-
-      await RouterService.configureMeshSatellite(
-        satIp: currentIp,
-        satPassword: satPassword,
-        targetIp: targetIp,
-        mainGateway: _currentIp,
-        ssid: ssid,
-        key: key,
-        encryption: _enc24,
-        txPower: txPower,
-      );
-
-      _showSnack('Paso 3/3: Activando Roaming 802.11r en router principal...');
-      await RouterService.enableMeshRoamingOnMain(_currentIp, _currentPassword);
-
-      setState(() {
-        if (isSat2) {
-          _sat2CurrentIpController.text = targetIp;
-        } else {
-          _sat3CurrentIpController.text = targetIp;
-        }
-      });
-
-      _showSnack('¡Satélite sincronizado! Ahora opera en $targetIp');
-
-      // Medir calidad a la nueva IP
-      await Future.delayed(const Duration(seconds: 4));
-      _checkQuality(targetIp, isSat2);
-    } catch (e) {
-      _showSnack('Error al vincular satélite en $currentIp: $e', isError: true);
-    } finally {
-      setState(() => _isLoading = false);
-    }
-  }
-
-  // Aprovisionamiento Guiado Directo
-  Future<void> _runDirectProvisioning() async {
-    final satIp = _provSatIpController.text.trim();
-    final satPass = _provSatPassController.text.trim();
-    final targetIp = _provSelectedSat == 'sat2' ? '192.168.1.2' : '192.168.1.3';
+  // TAB 2: Aprovisionar Satélite desde el teléfono
+  Future<void> _runProvisionSatellite() async {
+    final satName = _addSatNameController.text.trim();
+    final satPass = _addSatPassController.text.trim();
+    final targetIp = _addSatPresetIp;
     final mainGw = _currentIp.isNotEmpty ? _currentIp : '192.168.1.1';
-    final ssid = _provSsidController.text.trim().isNotEmpty
-        ? _provSsidController.text.trim()
-        : (_ssid24Controller.text.trim().isNotEmpty ? _ssid24Controller.text.trim() : 'LanRouterWiFi');
-    final key = _provKeyController.text.trim().isNotEmpty
-        ? _provKeyController.text.trim()
-        : _key24Controller.text.trim();
+    final mainSsid = _ssid24Controller.text.trim().isNotEmpty ? _ssid24Controller.text.trim() : 'LanRouterWiFi';
+    final mainKey = _key24Controller.text.trim();
 
-    if (satIp.isEmpty) {
-      return _showSnack('Ingresa la IP actual del satélite (por defecto 192.168.1.1)', isError: true);
-    }
-    if (satPass.isEmpty) {
-      return _showSnack('Ingresa la clave de la etiqueta del satélite a aprovisionar', isError: true);
-    }
+    if (satName.isEmpty) return _showSnack('Indica un nombre para el satélite (ej: Equipo Sala)', isError: true);
+    if (satPass.isEmpty) return _showSnack('Ingresa la contraseña de la etiqueta del satélite', isError: true);
+    if (mainSsid.isEmpty) return _showSnack('Configura primero el SSID de tu red Wi-Fi en la pestaña 1', isError: true);
 
-    setState(() => _isProvisioning = true);
+    setState(() => _isProvisioningSat = true);
     try {
-      _showSnack('Iniciando aprovisionamiento en $satIp...');
+      _showSnack('Conectando a satélite en 192.168.1.1 y aprovisionando como "$satName"...');
       await RouterService.provisionSatelliteDirect(
-        satIp: satIp,
+        satIp: '192.168.1.1',
         satPassword: satPass,
         targetIp: targetIp,
         mainGateway: mainGw,
-        mainSsid: ssid,
-        mainKey: key,
-        connectionMode: _provConnMode,
+        mainSsid: mainSsid,
+        mainKey: mainKey,
+        satName: satName,
       );
 
-      // Si el router principal está conectado, también activar 802.11r en el principal
-      try {
-        if (_isConnected && _currentIp != satIp) {
-          await RouterService.enableMeshRoamingOnMain(_currentIp, _currentPassword);
-        }
-      } catch (_) {}
+      // Si el satélite no estaba en la lista de nodos, agregarlo o actualizarlo
+      final existingIdx = _meshNodes.indexWhere((n) => n.ip == targetIp);
+      if (existingIdx != -1) {
+        _meshNodes[existingIdx].name = satName;
+        _meshNodes[existingIdx].password = satPass;
+      } else {
+        _meshNodes.add(MeshNode(name: satName, ip: targetIp, password: satPass));
+      }
 
-      // Actualizar controladores
-      setState(() {
-        if (_provSelectedSat == 'sat2') {
-          _sat2CurrentIpController.text = targetIp;
-          _sat2PassController.text = satPass;
-        } else {
-          _sat3CurrentIpController.text = targetIp;
-          _sat3PassController.text = satPass;
-        }
-      });
-
-      _showSnack('¡Aprovisionamiento completado! El satélite ahora opera en $targetIp (DHCP apagado, puertos unificados)');
+      if (mounted) {
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            backgroundColor: const Color(0xFF1E293B),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: Row(
+              children: [
+                const Icon(Icons.check_circle, color: Color(0xFF10B981), size: 28),
+                const SizedBox(width: 10),
+                Expanded(child: Text('¡$satName Vinculado!', style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold))),
+              ],
+            ),
+            content: Text(
+              'El equipo ha sido configurado como Satélite Mesh:\n\n'
+              '• Nombre: $satName\n'
+              '• Nueva IP: $targetIp\n'
+              '• Red Wi-Fi clonada: $mainSsid\n'
+              '• Servidor DHCP: Apagado\n'
+              '• Minim Cloud: Desactivado\n\n'
+              '👉 PASO FINAL:\n'
+              'Reconecta tu celular al Wi-Fi de tu router principal ($mainSsid) y ve a la pestaña "Control Satélites".',
+              style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.4),
+            ),
+            actions: [
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2563EB),
+                  padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  setState(() => _currentIndex = 2); // Ir a la pestaña de Control Mesh
+                },
+                child: const Text('Ir a Control Satélites', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              ),
+            ],
+          ),
+        );
+      }
     } catch (e) {
-      _showSnack('Error aprovisionando satélite: $e', isError: true);
+      _showSnack('Error al aprovisionar satélite: $e', isError: true);
     } finally {
-      setState(() => _isProvisioning = false);
+      setState(() => _isProvisioningSat = false);
+    }
+  }
+
+  // TAB 3: Comprobar Calidad de un Nodo Satélite
+  Future<void> _checkNodeQuality(MeshNode node) async {
+    setState(() => node.isChecking = true);
+    try {
+      final q = await RouterService.checkSatelliteQuality(_currentIp, _currentPassword, node.ip);
+      setState(() => node.quality = q);
+    } catch (_) {
+      setState(() {
+        node.quality = SatelliteQuality(
+          isOnline: false,
+          latencyMs: 0,
+          signalDbm: -100,
+          qualityPercent: 0,
+          linkType: 'Desconectado',
+          statusText: 'No responde en ${node.ip}',
+        );
+      });
+    } finally {
+      setState(() => node.isChecking = false);
+    }
+  }
+
+  // TAB 3: Comprobar Calidad de todos los Satélites
+  Future<void> _checkAllNodes() async {
+    setState(() => _isCheckingAllNodes = true);
+    try {
+      for (var node in _meshNodes) {
+        await _checkNodeQuality(node);
+      }
+      _showSnack('Estado de la red Mesh actualizado');
+    } finally {
+      setState(() => _isCheckingAllNodes = false);
+    }
+  }
+
+  // TAB 3: Cambiar Potencia en Satélite
+  Future<void> _setNodeTxPower(MeshNode node, int power) async {
+    final pass = node.password.isNotEmpty ? node.password : _currentPassword;
+    _showSnack('Ajustando potencia en ${node.name} (${node.ip})...');
+    try {
+      await RouterService.setSatelliteTxPower(node.ip, pass, power);
+      setState(() => node.txPower = power);
+      _showSnack('Potencia ajustada a $power dBm en ${node.name}');
+    } catch (e) {
+      _showSnack('Error al ajustar potencia en ${node.name}: $e', isError: true);
+    }
+  }
+
+  // TAB 3: Cambiar Nombre de Satélite (Hostname)
+  Future<void> _renameNode(MeshNode node) async {
+    final ctrl = TextEditingController(text: node.name);
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: Text('Renombrar ${node.name}', style: const TextStyle(color: Colors.white, fontSize: 16)),
+        content: TextField(
+          controller: ctrl,
+          style: const TextStyle(color: Colors.white),
+          decoration: const InputDecoration(
+            labelText: 'Nuevo nombre del satélite',
+            hintText: 'Ej: Equipo Sala, Estudio, etc.',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2563EB)),
+            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+            child: const Text('Guardar'),
+          ),
+        ],
+      ),
+    );
+
+    if (newName != null && newName.isNotEmpty) {
+      final pass = node.password.isNotEmpty ? node.password : _currentPassword;
+      try {
+        await RouterService.setHostname(node.ip, pass, newName);
+        setState(() => node.name = newName);
+        _showSnack('Nombre cambiado a "$newName" en ${node.ip}');
+      } catch (e) {
+        _showSnack('Error al cambiar nombre: $e', isError: true);
+      }
+    }
+  }
+
+  // TAB 3: Reiniciar Satélite
+  Future<void> _rebootNode(MeshNode node) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: Text('¿Reiniciar ${node.name}?', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        content: Text('El equipo en ${node.ip} se reiniciará. Tomará unos 60 segundos en reconectarse.', style: const TextStyle(color: Colors.white70, fontSize: 13)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Reiniciar Ahora'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    final pass = node.password.isNotEmpty ? node.password : _currentPassword;
+    try {
+      await RouterService.rebootRouter(node.ip, pass);
+      _showSnack('Reinicio enviado a ${node.name}');
+    } catch (_) {
+      _showSnack('Reinicio iniciado en ${node.name}');
     }
   }
 
@@ -788,77 +530,83 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   Widget build(BuildContext context) {
     if (!_isConnected) {
       return Scaffold(
-        appBar: AppBar(
-          title: const Text('Lan Router Management', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
-          backgroundColor: const Color(0xFF1E293B),
-        ),
-        body: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(20),
-            child: Card(
-              color: const Color(0xFF1E293B),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-              child: Padding(
-                padding: const EdgeInsets.all(22),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const Icon(Icons.wifi_tethering, size: 56, color: Color(0xFF3B82F6)),
-                    const SizedBox(height: 12),
-                    const Text(
-                      'Gestión Local Motorola MH7601',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
-                    ),
-                    const SizedBox(height: 6),
-                    const Text(
-                      'Desbloqueo y gestión directa sin MotoSync Cloud',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 12, color: Colors.grey),
-                    ),
-                    const SizedBox(height: 24),
-                    TextField(
-                      controller: _ipController,
-                      style: const TextStyle(color: Colors.white),
-                      decoration: const InputDecoration(
-                        labelText: 'IP del Router',
-                        border: OutlineInputBorder(),
-                        prefixIcon: Icon(Icons.dns, color: Color(0xFF3B82F6)),
+        body: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [Color(0xFF0F172A), Color(0xFF1E293B)],
+            ),
+          ),
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: Card(
+                color: const Color(0xFF1E293B),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                child: Padding(
+                  padding: const EdgeInsets.all(22),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Icon(Icons.wifi_tethering, size: 56, color: Color(0xFF3B82F6)),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Lan Router Management',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
                       ),
-                    ),
-                    const SizedBox(height: 14),
-                    TextField(
-                      controller: _passController,
-                      obscureText: true,
-                      style: const TextStyle(color: Colors.white),
-                      decoration: const InputDecoration(
-                        labelText: 'Contraseña de fábrica (Etiqueta)',
-                        border: OutlineInputBorder(),
-                        prefixIcon: Icon(Icons.key, color: Color(0xFF3B82F6)),
+                      const SizedBox(height: 6),
+                      const Text(
+                        'Gestión Local Directa Motorola MH7601 (Sin Minim Cloud)',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 12, color: Colors.grey),
                       ),
-                    ),
-                    const SizedBox(height: 20),
-                    ElevatedButton(
-                      onPressed: _isLoading ? null : _login,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF2563EB),
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(vertical: 16),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                      const SizedBox(height: 24),
+                      TextField(
+                        controller: _ipController,
+                        style: const TextStyle(color: Colors.white),
+                        decoration: const InputDecoration(
+                          labelText: 'IP del Router Principal',
+                          hintText: '192.168.1.1',
+                          border: OutlineInputBorder(),
+                          prefixIcon: Icon(Icons.dns, color: Color(0xFF3B82F6)),
+                        ),
                       ),
-                      child: _isLoading
-                          ? const SizedBox(
-                              height: 22,
-                              width: 22,
-                              child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5),
-                            )
-                          : const Text(
-                              'Conectar y Desbloquear Router',
-                              style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
-                            ),
-                    ),
-                  ],
+                      const SizedBox(height: 14),
+                      TextField(
+                        controller: _passController,
+                        obscureText: true,
+                        style: const TextStyle(color: Colors.white),
+                        decoration: const InputDecoration(
+                          labelText: 'Contraseña de fábrica (Etiqueta)',
+                          border: OutlineInputBorder(),
+                          prefixIcon: Icon(Icons.key, color: Color(0xFF3B82F6)),
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      ElevatedButton(
+                        onPressed: _isLoading ? null : _login,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF2563EB),
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                        ),
+                        child: _isLoading
+                            ? const SizedBox(
+                                height: 22,
+                                width: 22,
+                                child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5),
+                              )
+                            : const Text(
+                                'Conectar al Router Principal',
+                                style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
+                              ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -868,90 +616,152 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     }
 
     final pages = [
-      _buildDashboardTab(),
-      _buildWifiTab(),
-      _buildNetworkTab(),
-      _buildMeshTab(),
+      _buildCreateWifiTab(),
+      _buildAddSatelliteTab(),
+      _buildControlSatellitesTab(),
     ];
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(_status?.model ?? 'Motorola Router', style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(_status?.hostname ?? 'Router Principal', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+            Text('${_status?.model ?? "Motorola MH7601"} • $_currentIp', style: const TextStyle(fontSize: 11, color: Colors.white70)),
+          ],
+        ),
         backgroundColor: const Color(0xFF1E293B),
         actions: [
           IconButton(
-            icon: const Icon(Icons.logout, color: Colors.white),
+            tooltip: 'Cerrar Sesión',
+            icon: const Icon(Icons.logout, color: Colors.white70),
             onPressed: () => setState(() => _isConnected = false),
           ),
         ],
       ),
       body: pages[_currentIndex],
       bottomNavigationBar: NavigationBar(
+        backgroundColor: const Color(0xFF0F172A),
+        indicatorColor: const Color(0xFF2563EB).withOpacity(0.3),
         selectedIndex: _currentIndex,
         onDestinationSelected: (idx) => setState(() => _currentIndex = idx),
         destinations: const [
-          NavigationDestination(icon: Icon(Icons.dashboard_outlined), selectedIcon: Icon(Icons.dashboard), label: 'Estado'),
-          NavigationDestination(icon: Icon(Icons.wifi_outlined), selectedIcon: Icon(Icons.wifi), label: 'Wi-Fi'),
-          NavigationDestination(icon: Icon(Icons.lan_outlined), selectedIcon: Icon(Icons.lan), label: 'Red/DHCP'),
-          NavigationDestination(icon: Icon(Icons.grid_view_outlined), selectedIcon: Icon(Icons.grid_view), label: 'Mesh'),
+          NavigationDestination(
+            icon: Icon(Icons.wifi_outlined),
+            selectedIcon: Icon(Icons.wifi, color: Color(0xFF60A5FA)),
+            label: 'Crea tus Redes Wi-Fi',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.add_circle_outline),
+            selectedIcon: Icon(Icons.add_circle, color: Color(0xFF60A5FA)),
+            label: 'Agregar Satélite',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.hub_outlined),
+            selectedIcon: Icon(Icons.hub, color: Color(0xFF60A5FA)),
+            label: 'Control Satélites',
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildDashboardTab() {
+  // =========================================================================
+  // PESTAÑA 1: CREA TUS REDES WI-FI & AJUSTES DEL ROUTER PRINCIPAL
+  // =========================================================================
+  Widget _buildCreateWifiTab() {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        // Card 1: Identidad del Equipo & Minim Cloud
         Card(
-          color: const Color(0xFF1E293B),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           child: Padding(
             padding: const EdgeInsets.all(16),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('Router Principal', style: TextStyle(color: Color(0xFF3B82F6), fontWeight: FontWeight.bold)),
-                const SizedBox(height: 4),
-                Text(_status?.model ?? 'MH7601', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
-                Text('IP Local: $_currentIp', style: const TextStyle(color: Colors.grey)),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 12),
-        Card(
-          color: const Color(0xFF1E293B),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('Dispositivos Conectados', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
-                const SizedBox(height: 10),
-                if (_status?.clients.isEmpty ?? true)
-                  const Text('No hay clientes DHCP registrados', style: TextStyle(color: Colors.grey))
-                else
-                  ..._status!.clients.map((c) => ListTile(
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    leading: const CircleAvatar(
-                      backgroundColor: Color(0xFF2563EB),
-                      radius: 16,
-                      child: Icon(Icons.devices, size: 16, color: Colors.white),
+                const Row(
+                  children: [
+                    Icon(Icons.badge, color: Color(0xFF60A5FA), size: 22),
+                    SizedBox(width: 8),
+                    Text('Nombre del Equipo', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                const Text('Asigna un nombre para identificar este equipo (ej: Router Habitación, Principal, etc.)', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _routerNameController,
+                        style: const TextStyle(color: Colors.white),
+                        decoration: const InputDecoration(
+                          labelText: 'Nombre del Router',
+                          hintText: 'Router Habitación',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                      ),
                     ),
-                    title: Text(c.name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
-                    subtitle: Text(c.mac, style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                    trailing: Text(c.ip, style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.greenAccent)),
-                  )),
+                    const SizedBox(width: 10),
+                    ElevatedButton.icon(
+                      onPressed: _isLoading ? null : _saveRouterName,
+                      icon: const Icon(Icons.check, size: 18),
+                      label: const Text('Guardar'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF2563EB),
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+                      ),
+                    ),
+                  ],
+                ),
+                const Divider(height: 24),
+                // Minim Cloud Status & Switch
+                Row(
+                  children: [
+                    const Icon(Icons.cloud_off, color: Colors.amberAccent, size: 22),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('Agente en la Nube Minim (Motosync)', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+                          Text(
+                            _status?.minimStopped == true
+                                ? 'Desactivado (100% Offline y seguro ante caídas)'
+                                : 'Activo en segundo plano (Puede sobreescribir cambios)',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: _status?.minimStopped == true ? const Color(0xFF34D399) : Colors.amberAccent,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    ElevatedButton(
+                      onPressed: _isLoading ? null : _disableMinimCloud,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: _status?.minimStopped == true ? const Color(0xFF0F766E) : Colors.amber.shade800,
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      ),
+                      child: Text(
+                        _status?.minimStopped == true ? '✓ Apagado' : 'Apagar Minim',
+                        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white),
+                      ),
+                    ),
+                  ],
+                ),
               ],
             ),
           ),
         ),
-        const SizedBox(height: 12),
+
+        const SizedBox(height: 14),
+
+        // Card 2: Configuración Wi-Fi
         Card(
-          color: const Color(0xFF1E293B),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           child: Padding(
             padding: const EdgeInsets.all(16),
@@ -960,131 +770,20 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               children: [
                 const Row(
                   children: [
-                    Icon(Icons.tune, color: Color(0xFF818CF8), size: 18),
+                    Icon(Icons.wifi, color: Color(0xFF60A5FA), size: 22),
                     SizedBox(width: 8),
-                    Text('Mantenimiento del Sistema', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+                    Text('Emisión Wi-Fi Principal', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
                   ],
                 ),
-                const SizedBox(height: 12),
-                OutlinedButton.icon(
-                  onPressed: () async {
-                    final confirm = await showDialog<bool>(
-                      context: context,
-                      builder: (ctx) => AlertDialog(
-                        backgroundColor: const Color(0xFF1E293B),
-                        title: const Text('Reiniciar Router', style: TextStyle(color: Colors.white)),
-                        content: const Text('¿Estás seguro de que deseas reiniciar el equipo?', style: TextStyle(color: Colors.white70)),
-                        actions: [
-                          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
-                          ElevatedButton(
-                            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2563EB)),
-                            onPressed: () => Navigator.pop(ctx, true),
-                            child: const Text('Reiniciar', style: TextStyle(color: Colors.white)),
-                          ),
-                        ],
-                      ),
-                    );
-                    if (confirm == true) {
-                      try {
-                        await RouterService.executeSSH(_currentIp, _currentPassword, 'reboot');
-                        if (mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Reinicio enviado... Espera 90 segundos')));
-                        }
-                      } catch (_) {}
-                    }
-                  },
-                  icon: const Icon(Icons.restart_alt, color: Colors.amber),
-                  label: const Text('Reiniciar Router', style: TextStyle(color: Colors.white)),
-                  style: OutlinedButton.styleFrom(
-                    side: const BorderSide(color: Colors.white24),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                  ),
-                ),
-                const SizedBox(height: 10),
-                ElevatedButton.icon(
-                  onPressed: () async {
-                    final confirm = await showDialog<bool>(
-                      context: context,
-                      builder: (ctx) => AlertDialog(
-                        backgroundColor: const Color(0xFF1E293B),
-                        title: const Row(
-                          children: [
-                            Icon(Icons.warning_amber_rounded, color: Colors.redAccent),
-                            SizedBox(width: 8),
-                            Text('Reset Default', style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold)),
-                          ],
-                        ),
-                        content: const Text(
-                          '⚠️ ADVERTENCIA: Esta acción borrará todas las configuraciones personalizadas y restablecerá el router a los valores de fábrica de la etiqueta.\n\n¿Deseas continuar con el restablecimiento completo?',
-                          style: TextStyle(color: Colors.white70, fontSize: 13),
-                        ),
-                        actions: [
-                          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
-                          ElevatedButton(
-                            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
-                            onPressed: () => Navigator.pop(ctx, true),
-                            child: const Text('Sí, Restablecer Todo', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                          ),
-                        ],
-                      ),
-                    );
-                    if (confirm == true) {
-                      try {
-                        await RouterService.factoryReset(_currentIp, _currentPassword);
-                        if (mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              backgroundColor: Colors.redAccent,
-                              content: Text('Restablecimiento de fábrica iniciado. El router se reiniciará con su clave de fábrica.'),
-                              duration: Duration(seconds: 6),
-                            ),
-                          );
-                          setState(() => _isConnected = false);
-                        }
-                      } catch (err) {
-                        if (mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $err')));
-                        }
-                      }
-                    }
-                  },
-                  icon: const Icon(Icons.restore, color: Colors.white),
-                  label: const Text('Reset Default (Valores de Fábrica)', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF991B1B),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildWifiTab() {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        Card(
-          color: const Color(0xFF1E293B),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Text('Configurar Red Wi-Fi', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white)),
-                const SizedBox(height: 4),
-                const Text('Nombre, clave, cifrado y potencia de señal con Roaming 802.11r activo', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                const SizedBox(height: 6),
+                const Text('Configura el nombre de tu red, contraseña, seguridad y potencia de cobertura', style: TextStyle(fontSize: 11, color: Colors.grey)),
                 const SizedBox(height: 14),
 
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('Separar bandas (2.4 GHz y 5 GHz)', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white)),
                   subtitle: Text(
-                    _separateBands ? 'Dos nombres de red independientes' : 'Un solo nombre unificado inteligente',
+                    _separateBands ? 'Dos nombres de red independientes' : 'Un solo nombre inteligente (Mesh Smart Steering)',
                     style: const TextStyle(fontSize: 11, color: Colors.grey),
                   ),
                   value: _separateBands,
@@ -1092,7 +791,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 ),
                 const Divider(height: 20),
 
-                // Banda 2.4 GHz (o Principal)
+                // Banda 2.4 GHz o Unificada
                 Text(
                   _separateBands ? 'Banda 2.4 GHz' : 'Red Wi-Fi Principal (2.4 & 5 GHz)',
                   style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF3B82F6)),
@@ -1106,9 +805,16 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 const SizedBox(height: 10),
                 TextField(
                   controller: _key24Controller,
-                  obscureText: true,
+                  obscureText: _isPassObscure,
                   style: const TextStyle(color: Colors.white),
-                  decoration: const InputDecoration(labelText: 'Contraseña Wi-Fi', border: OutlineInputBorder()),
+                  decoration: InputDecoration(
+                    labelText: 'Contraseña Wi-Fi',
+                    border: const OutlineInputBorder(),
+                    suffixIcon: IconButton(
+                      icon: Icon(_isPassObscure ? Icons.visibility : Icons.visibility_off, color: Colors.grey),
+                      onPressed: () => setState(() => _isPassObscure = !_isPassObscure),
+                    ),
+                  ),
                 ),
                 const SizedBox(height: 10),
                 DropdownButtonFormField<String>(
@@ -1117,10 +823,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   style: const TextStyle(color: Colors.white, fontSize: 13),
                   decoration: const InputDecoration(labelText: 'Tipo de Cifrado (Seguridad)', border: OutlineInputBorder()),
                   items: const [
-                    DropdownMenuItem(value: 'psk2', child: Text('WPA2-PSK (Recomendado para máxima compatibilidad)')),
-                    DropdownMenuItem(value: 'sae-mixed', child: Text('WPA2 / WPA3 Personal (Mixto)')),
+                    DropdownMenuItem(value: 'psk2', child: Text('WPA2-PSK (Máxima compatibilidad - Recomendado)')),
+                    DropdownMenuItem(value: 'sae-mixed', child: Text('WPA2 / WPA3 Mixto (Moderno)')),
                     DropdownMenuItem(value: 'sae', child: Text('WPA3-SAE (Estricto)')),
-                    DropdownMenuItem(value: 'psk-mixed', child: Text('WPA / WPA2 (Dispositivos muy antiguos)')),
                   ],
                   onChanged: (v) {
                     if (v != null) setState(() => _enc24 = v);
@@ -1139,7 +844,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   const SizedBox(height: 10),
                   TextField(
                     controller: _key5Controller,
-                    obscureText: true,
+                    obscureText: _isPassObscure,
                     style: const TextStyle(color: Colors.white),
                     decoration: const InputDecoration(labelText: 'Contraseña 5 GHz', border: OutlineInputBorder()),
                   ),
@@ -1162,7 +867,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
 
                 const Divider(height: 28),
 
-                // Control de Potencia de Transmisión (Tx Power)
+                // Control de Potencia (Tx Power)
                 const Text('Potencia de Señal / Cobertura (Tx Power)', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orangeAccent)),
                 const SizedBox(height: 4),
                 const Text('Aumenta el alcance de las antenas para cubrir habitaciones lejanas', style: TextStyle(fontSize: 11, color: Colors.grey)),
@@ -1174,7 +879,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   decoration: const InputDecoration(labelText: 'Nivel de Potencia', border: OutlineInputBorder()),
                   items: const [
                     DropdownMenuItem(value: 23, child: Text('⚡ 23 dBm (100% - Máxima Potencia y Cobertura)')),
-                    DropdownMenuItem(value: 20, child: Text('🟢 20 dBm (75% - Alta)')),
+                    DropdownMenuItem(value: 20, child: Text('🟢 20 dBm (75% - Cobertura Alta)')),
                     DropdownMenuItem(value: 17, child: Text('🟡 17 dBm (50% - Media / Espacios pequeños)')),
                     DropdownMenuItem(value: 14, child: Text('🔵 14 dBm (25% - Baja / Ahorro energético)')),
                   ],
@@ -1183,30 +888,182 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   },
                 ),
 
-                const SizedBox(height: 16),
+                const SizedBox(height: 14),
 
                 // Switch Modo Compatibilidad Wi-Fi 6
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
-                  title: const Text('Modo Compatibilidad IoT / Dispositivos Antiguos', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white)),
+                  title: const Text('Modo Compatibilidad Dispositivos Antiguos / IoT', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white)),
                   subtitle: const Text(
-                    'Desactiva 802.11ax en 2.4 GHz para que bombillos inteligentes, enchufes y celulares viejos se conecten sin fallos',
+                    'Desactiva 802.11ax en 2.4 GHz para que bombillos inteligentes, TVs viejas e impresoras se conecten sin fallos',
                     style: TextStyle(fontSize: 11, color: Colors.grey),
                   ),
                   value: _legacyMode,
                   onChanged: (val) => setState(() => _legacyMode = val),
                 ),
 
-                const SizedBox(height: 22),
-                ElevatedButton(
+                const SizedBox(height: 20),
+                ElevatedButton.icon(
                   onPressed: _isLoading ? null : _saveWifi,
+                  icon: const Icon(Icons.save),
+                  label: const Text('Guardar Cambios Wi-Fi en Router Principal', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF2563EB),
                     foregroundColor: Colors.white,
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   ),
-                  child: const Text('Guardar y Aplicar Configuración Wi-Fi', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        const SizedBox(height: 14),
+
+        // Card 3: Red LAN & Personalización DHCP
+        Card(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          child: Theme(
+            data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+            child: ExpansionTile(
+              initiallyExpanded: false,
+              leading: const Icon(Icons.lan, color: Color(0xFF60A5FA)),
+              title: const Text('Personalización de Red LAN & DHCP', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+              subtitle: const Text('Rango de IPs, servidores DNS, servidor DHCP y dirección IP local', style: TextStyle(fontSize: 11, color: Colors.grey)),
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // Switch Servidor DHCP
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Servidor DHCP Automático (ON / OFF)', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+                        subtitle: Text(
+                          _dhcpEnabled ? 'Activado: Asigna direcciones IP a celulares y PCs' : 'APAGADO: Útil cuando este router es usado como satélite en LAN a LAN',
+                          style: TextStyle(fontSize: 11, color: _dhcpEnabled ? const Color(0xFF34D399) : Colors.redAccent),
+                        ),
+                        value: _dhcpEnabled,
+                        onChanged: (val) => setState(() => _dhcpEnabled = val),
+                      ),
+                      const SizedBox(height: 12),
+
+                      if (_dhcpEnabled) ...[
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: _dhcpStartController,
+                                keyboardType: TextInputType.number,
+                                style: const TextStyle(color: Colors.white),
+                                decoration: const InputDecoration(
+                                  labelText: 'IP Inicial DHCP',
+                                  hintText: '100',
+                                  border: OutlineInputBorder(),
+                                  isDense: true,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: TextField(
+                                controller: _dhcpLimitController,
+                                keyboardType: TextInputType.number,
+                                style: const TextStyle(color: Colors.white),
+                                decoration: const InputDecoration(
+                                  labelText: 'Límite de IPs',
+                                  hintText: '150',
+                                  border: OutlineInputBorder(),
+                                  isDense: true,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        DropdownButtonFormField<String>(
+                          value: _selectedDns.contains('1.1.1.1') ? '1.1.1.1,1.0.0.1' : (_selectedDns.contains('8.8.8.8') ? '8.8.8.8,8.8.4.4' : 'manual'),
+                          dropdownColor: const Color(0xFF1E293B),
+                          style: const TextStyle(color: Colors.white, fontSize: 13),
+                          decoration: const InputDecoration(labelText: 'Servidores DNS', border: OutlineInputBorder(), isDense: true),
+                          items: const [
+                            DropdownMenuItem(value: '1.1.1.1,1.0.0.1', child: Text('Cloudflare Rápido (1.1.1.1, 1.0.0.1)')),
+                            DropdownMenuItem(value: '8.8.8.8,8.8.4.4', child: Text('Google DNS (8.8.8.8, 8.8.4.4)')),
+                            DropdownMenuItem(value: 'manual', child: Text('DNS Personalizado')),
+                          ],
+                          onChanged: (v) {
+                            if (v != null && v != 'manual') setState(() => _selectedDns = v);
+                          },
+                        ),
+                        const SizedBox(height: 12),
+                        ElevatedButton(
+                          onPressed: _isLoading ? null : _saveDhcp,
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF0284C7),
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                          ),
+                          child: const Text('Guardar Rango DHCP y DNS', style: TextStyle(fontWeight: FontWeight.bold)),
+                        ),
+                      ],
+
+                      const Divider(height: 28),
+
+                      // IP Estática LAN
+                      const Text('Dirección IP Local Estática (LAN)', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+                      const SizedBox(height: 6),
+                      TextField(
+                        controller: _lanIpController,
+                        style: const TextStyle(color: Colors.white),
+                        decoration: const InputDecoration(
+                          labelText: 'IP Local del Router',
+                          hintText: '192.168.1.1',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: _lanNetmaskController,
+                              style: const TextStyle(color: Colors.white),
+                              decoration: const InputDecoration(
+                                labelText: 'Máscara',
+                                hintText: '255.255.255.0',
+                                border: OutlineInputBorder(),
+                                isDense: true,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: TextField(
+                              controller: _lanGatewayController,
+                              style: const TextStyle(color: Colors.white),
+                              decoration: const InputDecoration(
+                                labelText: 'Gateway (Opcional)',
+                                hintText: '192.168.1.1',
+                                border: OutlineInputBorder(),
+                                isDense: true,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      ElevatedButton(
+                        onPressed: _isLoading ? null : _saveLanIp,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF334155),
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                        ),
+                        child: const Text('Actualizar IP Estática LAN (Reinicia Red)', style: TextStyle(fontWeight: FontWeight.bold)),
+                      ),
+                    ],
+                  ),
                 ),
               ],
             ),
@@ -1216,11 +1073,14 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     );
   }
 
-  Widget _buildNetworkTab() {
+  // =========================================================================
+  // PESTAÑA 2: AGREGAR SATÉLITES A TU RED MESH (FLUJO 100% INALÁMBRICO)
+  // =========================================================================
+  Widget _buildAddSatelliteTab() {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        // 1. Card Asistente: Modo Satélite / AP (LAN a LAN sin colisión)
+        // Card Instrucciones
         Card(
           color: const Color(0xFF0F2B48),
           shape: RoundedRectangleBorder(
@@ -1230,39 +1090,41 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
           child: Padding(
             padding: const EdgeInsets.all(16),
             child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Row(
                   children: [
-                    Icon(Icons.lan, color: Color(0xFF38BDF8), size: 24),
+                    Icon(Icons.hub, color: Color(0xFF38BDF8), size: 24),
                     SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        'Interconexión por Cable (LAN a LAN)',
+                        'Asistente de Vinculación Mesh Inalámbrica',
                         style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
                 const Text(
-                  'Si vas a conectar este satélite al router principal con cable de red, activa este modo. '
-                  'Apagará de inmediato el servidor DHCP y fijará su IP en 192.168.1.2 para que ambos equipos '
-                  'no colisionen en la misma red.',
+                  'Este asistente convierte cualquier equipo Motorola adicional en un satélite repetidor sincronizado con tu router principal, sin cables y sin depender de MotoSync Cloud.',
                   style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.35),
                 ),
-                const SizedBox(height: 14),
-                ElevatedButton.icon(
-                  onPressed: _isLoading ? null : _applySatelliteApModeDialog,
-                  icon: const Icon(Icons.flash_on, color: Colors.white),
-                  label: const Text(
-                    'Convertir en Satélite / Apagar DHCP',
-                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white),
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0C1929),
+                    borderRadius: BorderRadius.circular(10),
                   ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF0284C7),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  child: const Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Pasos previos sencillos:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF38BDF8))),
+                      SizedBox(height: 6),
+                      Text('1. Enciende el satélite cerca del router principal.', style: TextStyle(fontSize: 11, color: Colors.white70)),
+                      Text('2. En los ajustes Wi-Fi de tu celular, conéctate temporalmente a la red de fábrica del satélite (ej: Motorola-XXXX) usando la clave de su etiqueta.', style: TextStyle(fontSize: 11, color: Colors.white70)),
+                      Text('3. Regresa a esta pantalla, completa los datos abajo y pulsa "Aprovisionar Satélite Mesh".', style: TextStyle(fontSize: 11, color: Colors.white70)),
+                    ],
                   ),
                 ),
               ],
@@ -1272,266 +1134,133 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
 
         const SizedBox(height: 16),
 
-        // 2. Card Dirección IP Local (LAN)
+        // Formulario de Vinculación
         Card(
-          color: const Color(0xFF1E293B),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           child: Padding(
             padding: const EdgeInsets.all(16),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const Row(
-                  children: [
-                    Icon(Icons.router, color: Color(0xFF60A5FA), size: 22),
-                    SizedBox(width: 8),
-                    Text('Dirección IP Local (LAN IP)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                const Text(
-                  'Establece la IP estática de este equipo. El router principal debe ser 192.168.1.1. Los satélites secundarios deben ser 192.168.1.2, 192.168.1.3, etc.',
-                  style: TextStyle(fontSize: 12, color: Colors.grey),
-                ),
+                const Text('Configurar Nuevo Satélite', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
                 const SizedBox(height: 14),
+
+                // Nombre para el Satélite
                 TextField(
-                  controller: _lanIpController,
+                  controller: _addSatNameController,
                   style: const TextStyle(color: Colors.white),
                   decoration: const InputDecoration(
-                    labelText: 'Dirección IP del Router',
-                    hintText: '192.168.1.1',
+                    labelText: 'Nombre para este Satélite',
+                    hintText: 'Ej: Equipo Sala, Router Estudio, etc.',
                     border: OutlineInputBorder(),
+                    prefixIcon: Icon(Icons.edit, color: Color(0xFF3B82F6)),
                   ),
                 ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _lanNetmaskController,
-                        style: const TextStyle(color: Colors.white),
-                        decoration: const InputDecoration(
-                          labelText: 'Máscara de Red',
-                          hintText: '255.255.255.0',
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
+
+                const SizedBox(height: 12),
+
+                // Clave de la etiqueta del Satélite
+                TextField(
+                  controller: _addSatPassController,
+                  obscureText: _addSatPassObscure,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    labelText: 'Contraseña de la etiqueta del Satélite',
+                    border: const OutlineInputBorder(),
+                    prefixIcon: const Icon(Icons.key, color: Color(0xFF3B82F6)),
+                    suffixIcon: IconButton(
+                      icon: Icon(_addSatPassObscure ? Icons.visibility : Icons.visibility_off, color: Colors.grey),
+                      onPressed: () => setState(() => _addSatPassObscure = !_addSatPassObscure),
                     ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: TextField(
-                        controller: _lanGatewayController,
-                        style: const TextStyle(color: Colors.white),
-                        decoration: const InputDecoration(
-                          labelText: 'Gateway (Router Principal)',
-                          hintText: '192.168.1.1',
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
+
                 const SizedBox(height: 14),
-                ElevatedButton(
-                  onPressed: _isLoading ? null : _saveLanIp,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF2563EB),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  ),
-                  child: const Text('Guardar IP Local (Reinicia Red)', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                ),
-              ],
-            ),
-          ),
-        ),
 
-        const SizedBox(height: 16),
-
-        // 3. Card DHCP y DNS
-        Card(
-          color: const Color(0xFF1E293B),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                // Selector de IP del Satélite
+                const Text('IP asignada al Satélite:', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white)),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
                   children: [
-                    const Text('Servidor DHCP y DNS', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: _dhcpEnabled ? const Color(0xFF065F46) : const Color(0xFF991B1B),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Text(
-                        _dhcpEnabled ? 'ACTIVO' : 'APAGADO',
-                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white),
-                      ),
+                    ChoiceChip(
+                      label: const Text('Satélite 1 (192.168.1.2)'),
+                      selected: _addSatPresetIp == '192.168.1.2',
+                      selectedColor: const Color(0xFF2563EB),
+                      onSelected: (val) {
+                        if (val) setState(() => _addSatPresetIp = '192.168.1.2');
+                      },
+                    ),
+                    ChoiceChip(
+                      label: const Text('Satélite 2 (192.168.1.3)'),
+                      selected: _addSatPresetIp == '192.168.1.3',
+                      selectedColor: const Color(0xFF2563EB),
+                      onSelected: (val) {
+                        if (val) setState(() => _addSatPresetIp = '192.168.1.3');
+                      },
+                    ),
+                    ChoiceChip(
+                      label: const Text('Satélite 3 (192.168.1.4)'),
+                      selected: _addSatPresetIp == '192.168.1.4',
+                      selectedColor: const Color(0xFF2563EB),
+                      onSelected: (val) {
+                        if (val) setState(() => _addSatPresetIp = '192.168.1.4');
+                      },
                     ),
                   ],
                 ),
-                const SizedBox(height: 10),
 
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('Servidor DHCP Habilitado', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
-                  subtitle: Text(
-                    _dhcpEnabled
-                        ? 'Asigna direcciones IP automáticamente a clientes (Router Principal).'
-                        : 'DESACTIVADO: Este satélite no asignará IPs (evita conflicto con el router principal).',
-                    style: TextStyle(fontSize: 12, color: _dhcpEnabled ? Colors.grey : const Color(0xFFFCA5A5)),
+                const SizedBox(height: 16),
+
+                // Resumen de red a clonar
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F172A),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: Colors.white12),
                   ),
-                  value: _dhcpEnabled,
-                  activeColor: const Color(0xFF10B981),
-                  onChanged: (val) {
-                    setState(() => _dhcpEnabled = val);
-                  },
-                ),
-
-                const Divider(height: 20),
-
-                if (_dhcpEnabled) ...[
-                  Row(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _dhcpStartController,
-                          keyboardType: TextInputType.number,
-                          style: const TextStyle(color: Colors.white),
-                          decoration: const InputDecoration(labelText: 'IP Inicio Rango', border: OutlineInputBorder()),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: TextField(
-                          controller: _dhcpLimitController,
-                          keyboardType: TextInputType.number,
-                          style: const TextStyle(color: Colors.white),
-                          decoration: const InputDecoration(labelText: 'Límite IPs', border: OutlineInputBorder()),
-                        ),
+                      const Text('Red Wi-Fi que emitirá este satélite:', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          const Icon(Icons.wifi, color: Color(0xFF34D399), size: 18),
+                          const SizedBox(width: 6),
+                          Text(
+                            _ssid24Controller.text.isNotEmpty ? _ssid24Controller.text : 'LanRouterWiFi',
+                            style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white),
+                          ),
+                        ],
                       ),
                     ],
                   ),
-                  const SizedBox(height: 12),
-                ],
-
-                DropdownButtonFormField<String>(
-                  value: _selectedDns.contains('1.1.1.1') ? '1.1.1.1,1.0.0.1' : (_selectedDns.contains('8.8.8.8') ? '8.8.8.8,8.8.4.4' : '1.1.1.1,1.0.0.1'),
-                  decoration: const InputDecoration(labelText: 'Servidores DNS', border: OutlineInputBorder()),
-                  dropdownColor: const Color(0xFF1E293B),
-                  items: const [
-                    DropdownMenuItem(value: '1.1.1.1,1.0.0.1', child: Text('Cloudflare (1.1.1.1) - Rápido')),
-                    DropdownMenuItem(value: '8.8.8.8,8.8.4.4', child: Text('Google DNS (8.8.8.8) - Estable')),
-                    DropdownMenuItem(value: '9.9.9.9,149.112.112.112', child: Text('Quad9 (9.9.9.9) - Seguridad')),
-                  ],
-                  onChanged: (val) {
-                    if (val != null) setState(() => _selectedDns = val);
-                  },
                 ),
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: _isLoading ? null : _saveDhcp,
+
+                const SizedBox(height: 20),
+
+                // Botón de Aprovisionamiento
+                ElevatedButton.icon(
+                  onPressed: _isProvisioningSat ? null : _runProvisionSatellite,
+                  icon: _isProvisioningSat
+                      ? const SizedBox(
+                          height: 20,
+                          width: 20,
+                          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5),
+                        )
+                      : const Icon(Icons.flash_on),
+                  label: Text(
+                    _isProvisioningSat ? 'Aprovisionando Satélite...' : 'Aprovisionar Satélite Mesh Ahora',
+                    style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                  ),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: _dhcpEnabled ? const Color(0xFF6366F1) : const Color(0xFFDC2626),
+                    backgroundColor: const Color(0xFF10B981),
                     foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 13),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                   ),
-                  child: Text(
-                    _dhcpEnabled ? 'Actualizar DHCP y DNS' : 'Confirmar Apagado de DHCP',
-                    style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-
-        const SizedBox(height: 16),
-
-        // 4. Card Port Forwarding
-        Card(
-          color: const Color(0xFF1E293B),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Text('Reenvío de Puertos (Port Forward)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: _pfNameController,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: const InputDecoration(labelText: 'Nombre regla (ej: Camara / Servidor)', border: OutlineInputBorder()),
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _pfExtPortController,
-                        keyboardType: TextInputType.number,
-                        style: const TextStyle(color: Colors.white),
-                        decoration: const InputDecoration(labelText: 'Puerto Externo', border: OutlineInputBorder()),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: DropdownButtonFormField<String>(
-                        value: _pfProto,
-                        decoration: const InputDecoration(labelText: 'Protocolo', border: OutlineInputBorder()),
-                        dropdownColor: const Color(0xFF1E293B),
-                        items: const [
-                          DropdownMenuItem(value: 'tcp udp', child: Text('TCP/UDP')),
-                          DropdownMenuItem(value: 'tcp', child: Text('TCP')),
-                          DropdownMenuItem(value: 'udp', child: Text('UDP')),
-                        ],
-                        onChanged: (val) {
-                          if (val != null) setState(() => _pfProto = val);
-                        },
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                      flex: 2,
-                      child: TextField(
-                        controller: _pfIntIpController,
-                        style: const TextStyle(color: Colors.white),
-                        decoration: const InputDecoration(labelText: 'IP Destino (192.168.1.X)', border: OutlineInputBorder()),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      flex: 1,
-                      child: TextField(
-                        controller: _pfIntPortController,
-                        keyboardType: TextInputType.number,
-                        style: const TextStyle(color: Colors.white),
-                        decoration: const InputDecoration(labelText: 'Puerto Int.', border: OutlineInputBorder()),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: _isLoading ? null : _addPortForward,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF059669),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 13),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  ),
-                  child: const Text('Abrir Puerto', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
                 ),
               ],
             ),
@@ -1541,290 +1270,221 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     );
   }
 
-  Widget _buildMeshTab() {
-    final clients = _status?.clients ?? [];
-    final satCandidates = clients.where((c) {
-      final name = c.name.toUpperCase();
-      final mac = c.mac.toLowerCase();
-      final isMoto = name.contains('MH') || name.contains('MOTO') || 
-                     mac.startsWith('c8:c7:50') || mac.startsWith('00:0c:e7') || mac.startsWith('14:59:c0');
-      return isMoto && c.ip != _currentIp;
-    }).toList();
-
+  // =========================================================================
+  // PESTAÑA 3: CONTROL DE SATÉLITES CONECTADOS Y MONITOREO MESH
+  // =========================================================================
+  Widget _buildControlSatellitesTab() {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        // 1. TARJETA PRINCIPAL: AGREGAR DISPOSITIVO MESH
-        Card(
-          color: const Color(0xFF1E293B),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: Color(0xFF38BDF8), width: 1.5),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
+        // Header de acción
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF0284C7).withOpacity(0.2),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: const Icon(Icons.hub, color: Color(0xFF38BDF8), size: 26),
-                    ),
-                    const SizedBox(width: 12),
-                    const Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('Agregar Dispositivo Mesh', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
-                          Text('Empareja tu satélite en 3 simples pasos', style: TextStyle(fontSize: 12, color: Color(0xFF38BDF8))),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 14),
-                const Text(
-                  '1. Enciende el satélite adicional (espera luz azul parpadeando).\n'
-                  '2. Presiona "Escanear Redes Wi-Fi" y toca la red de tu Router Principal.\n'
-                  '3. Ingresa la clave y pulsa "Vincular Satélite".',
-                  style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.4),
-                ),
-                const SizedBox(height: 16),
-                ElevatedButton.icon(
-                  onPressed: _isScanningAir ? null : _scanWirelessAir,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF0284C7),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  ),
-                  icon: _isScanningAir
-                      ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                      : const Icon(Icons.radar, color: Colors.white),
-                  label: Text(
-                    _isScanningAir ? 'Escaneando redes en el aire...' : 'Escanear Redes Wi-Fi',
-                    style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
-                  ),
-                ),
+                Text('Satélites Mesh Activos', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
+                Text('Monitoreo en vivo y control individual de nodos', style: TextStyle(fontSize: 11, color: Colors.grey)),
               ],
             ),
-          ),
+            ElevatedButton.icon(
+              onPressed: _isCheckingAllNodes ? null : _checkAllNodes,
+              icon: _isCheckingAllNodes
+                  ? const SizedBox(height: 16, width: 16, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                  : const Icon(Icons.refresh, size: 18),
+              label: const Text('Comprobar', style: TextStyle(fontSize: 12)),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF2563EB),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              ),
+            ),
+          ],
         ),
 
         const SizedBox(height: 16),
 
-        // 2. LISTA DE REDES DISPONIBLES CON CALIDAD DE SEÑAL
-        if (_airScanResults.isNotEmpty) ...[
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text('📡 Redes Detectadas (${_airScanResults.length})', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
-              TextButton(
-                onPressed: () => setState(() => _airScanResults = []),
-                child: const Text('Limpiar', style: TextStyle(color: Colors.cyanAccent, fontSize: 12)),
+        // Lista de Satélites
+        if (_meshNodes.isEmpty)
+          const Card(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Center(
+                child: Text('No hay satélites registrados. Ve a la pestaña "Agregar Satélite".', style: TextStyle(color: Colors.grey)),
               ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          ..._airScanResults.map((r) {
-            final isSelected = _provSsidController.text == r.ssid;
-            return Container(
-              margin: const EdgeInsets.only(bottom: 8),
-              decoration: BoxDecoration(
-                color: isSelected
-                    ? const Color(0xFF0369A1).withOpacity(0.3)
-                    : (r.isMotorola ? const Color(0xFF1E3A8A).withOpacity(0.35) : const Color(0xFF1E293B)),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: isSelected ? Colors.cyanAccent : (r.isMotorola ? const Color(0xFF38BDF8) : const Color(0xFF334155)),
-                  width: isSelected ? 2 : 1,
+            ),
+          )
+        else
+          ..._meshNodes.map((node) => _buildSatelliteCard(node)),
+      ],
+    );
+  }
+
+  Widget _buildSatelliteCard(MeshNode node) {
+    final q = node.quality;
+    final isOnline = q?.isOnline ?? false;
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 16),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: BorderSide(
+          color: isOnline ? const Color(0xFF10B981).withOpacity(0.4) : Colors.white12,
+          width: 1.5,
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Cabecera del Nodo
+            Row(
+              children: [
+                Container(
+                  width: 36,
+                  height: 36,
+                  decoration: BoxDecoration(
+                    color: isOnline ? const Color(0xFF10B981).withOpacity(0.2) : Colors.white10,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Icon(
+                    Icons.router,
+                    color: isOnline ? const Color(0xFF34D399) : Colors.grey,
+                    size: 20,
+                  ),
                 ),
-              ),
-              child: ListTile(
-                onTap: () {
-                  setState(() {
-                    _provSsidController.text = r.ssid;
-                  });
-                  _showSnack('Red "${r.ssid}" seleccionada. Ingresa su clave abajo.');
-                },
-                leading: Icon(
-                  Icons.wifi,
-                  color: r.signal >= -65 ? Colors.greenAccent : (r.signal >= -78 ? Colors.amberAccent : Colors.redAccent),
-                  size: 24,
-                ),
-                title: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        r.ssid,
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          color: isSelected ? Colors.cyanAccent : Colors.white,
-                          fontSize: 14,
-                        ),
-                        overflow: TextOverflow.ellipsis,
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Text(node.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+                          IconButton(
+                            icon: const Icon(Icons.edit, size: 16, color: Color(0xFF60A5FA)),
+                            tooltip: 'Cambiar Nombre',
+                            onPressed: () => _renameNode(node),
+                          ),
+                        ],
                       ),
+                      Text('IP: ${node.ip}', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                    ],
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: isOnline ? const Color(0xFF10B981).withOpacity(0.2) : Colors.redAccent.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    isOnline ? 'En Línea' : 'Desconectado',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      color: isOnline ? const Color(0xFF34D399) : Colors.redAccent,
                     ),
-                    if (r.isMotorola) ...[
-                      const SizedBox(width: 6),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                        decoration: BoxDecoration(color: const Color(0xFF2563EB), borderRadius: BorderRadius.circular(6)),
-                        child: const Text('MOTOROLA', style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.white)),
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 12),
+
+            // Métricas de Enlace
+            if (q != null) ...[
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0F172A),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Column(
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('Tipo de enlace:', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                        Text(q.linkType, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('Latencia (Ping):', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                        Text('${q.latencyMs} ms', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF60A5FA))),
+                      ],
+                    ),
+                    if (q.linkType.contains('Wi-Fi')) ...[
+                      const SizedBox(height: 6),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text('Señal Wi-Fi Mesh:', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                          Text('${q.signalDbm} dBm (${q.qualityPercent}%)', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF34D399))),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      LinearProgressIndicator(
+                        value: (q.qualityPercent / 100).clamp(0.0, 1.0),
+                        backgroundColor: Colors.white12,
+                        color: q.qualityPercent > 70 ? const Color(0xFF10B981) : Colors.orangeAccent,
                       ),
                     ],
                   ],
                 ),
-                subtitle: Text('Señal: ${r.signal} dBm • Canal: ${r.channel}', style: const TextStyle(color: Colors.grey, fontSize: 11)),
-                trailing: ElevatedButton(
-                  onPressed: () {
-                    setState(() {
-                      _provSsidController.text = r.ssid;
-                    });
-                    _showSnack('Red "${r.ssid}" seleccionada.');
-                  },
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: isSelected ? Colors.cyanAccent : const Color(0xFF334155),
-                    foregroundColor: isSelected ? Colors.black : Colors.white,
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                    visualDensity: VisualDensity.compact,
+              ),
+              const SizedBox(height: 14),
+            ],
+
+            // Controles Individuales: Potencia de Transmisión & Reinicio
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<int>(
+                    value: node.txPower,
+                    dropdownColor: const Color(0xFF1E293B),
+                    style: const TextStyle(color: Colors.white, fontSize: 12),
+                    decoration: const InputDecoration(
+                      labelText: 'Potencia Satélite',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    items: const [
+                      DropdownMenuItem(value: 23, child: Text('⚡ 23 dBm (100% Máx)')),
+                      DropdownMenuItem(value: 20, child: Text('🟢 20 dBm (75%)')),
+                      DropdownMenuItem(value: 17, child: Text('🟡 17 dBm (50%)')),
+                      DropdownMenuItem(value: 14, child: Text('🔵 14 dBm (25%)')),
+                    ],
+                    onChanged: (p) {
+                      if (p != null) _setNodeTxPower(node, p);
+                    },
                   ),
-                  child: Text(isSelected ? '✓ Elegida' : 'Elegir', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
                 ),
-              ),
-            );
-          }),
-          const SizedBox(height: 16),
-        ],
-
-        // 3. FORMULARIO SIMPLE DE VINCULACIÓN AL ELEGIR RED
-        if (_provSsidController.text.isNotEmpty) ...[
-          Card(
-            color: const Color(0xFF0F172A),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16),
-              side: const BorderSide(color: Color(0xFF10B981), width: 1.5),
+                const SizedBox(width: 10),
+                IconButton.filled(
+                  tooltip: 'Comprobar Enlace',
+                  style: IconButton.styleFrom(backgroundColor: const Color(0xFF2563EB)),
+                  onPressed: node.isChecking ? null : () => _checkNodeQuality(node),
+                  icon: node.isChecking
+                      ? const SizedBox(height: 16, width: 16, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                      : const Icon(Icons.network_check, size: 20),
+                ),
+                const SizedBox(width: 6),
+                IconButton.filled(
+                  tooltip: 'Reiniciar Satélite',
+                  style: IconButton.styleFrom(backgroundColor: Colors.redAccent.withOpacity(0.8)),
+                  onPressed: () => _rebootNode(node),
+                  icon: const Icon(Icons.restart_alt, size: 20),
+                ),
+              ],
             ),
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Row(
-                    children: [
-                      const Icon(Icons.link, color: Colors.greenAccent, size: 24),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text('Vincular a: ${_provSsidController.text}', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
-                            const Text('Introduce la clave de esta red para sincronizar', style: TextStyle(fontSize: 11, color: Colors.greenAccent)),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-
-                  // Clave Wi-Fi
-                  TextField(
-                    controller: _provKeyController,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: InputDecoration(
-                      labelText: 'Contraseña Wi-Fi de "${_provSsidController.text}"',
-                      border: const OutlineInputBorder(),
-                      isDense: true,
-                      prefixIcon: const Icon(Icons.wifi_password, color: Colors.cyanAccent),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-
-                  // Clave etiqueta del satélite
-                  TextField(
-                    controller: _provSatPassController,
-                    obscureText: _isProvPassObscure,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: InputDecoration(
-                      labelText: 'Contraseña de la etiqueta del Satélite',
-                      border: const OutlineInputBorder(),
-                      isDense: true,
-                      helperText: 'Admin password impresa en la etiqueta inferior del satélite',
-                      helperStyle: const TextStyle(fontSize: 10, color: Colors.grey),
-                      prefixIcon: const Icon(Icons.key, color: Colors.amberAccent),
-                      suffixIcon: IconButton(
-                        icon: Icon(_isProvPassObscure ? Icons.visibility : Icons.visibility_off, color: Colors.grey, size: 18),
-                        onPressed: () => setState(() => _isProvPassObscure = !_isProvPassObscure),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-
-                  // Asignación de Satélite 2 o Satélite 3
-                  Row(
-                    children: [
-                      const Text('Asignar nodo:', style: TextStyle(fontSize: 12, color: Colors.white70)),
-                      const SizedBox(width: 10),
-                      ChoiceChip(
-                        label: const Text('Satélite 2 (192.168.1.2)'),
-                        selected: _provSelectedSat == 'sat2',
-                        selectedColor: const Color(0xFF2563EB),
-                        labelStyle: TextStyle(
-                          color: _provSelectedSat == 'sat2' ? Colors.white : Colors.grey,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 11,
-                        ),
-                        onSelected: (val) {
-                          if (val) setState(() => _provSelectedSat = 'sat2');
-                        },
-                      ),
-                      const SizedBox(width: 8),
-                      ChoiceChip(
-                        label: const Text('Satélite 3 (192.168.1.3)'),
-                        selected: _provSelectedSat == 'sat3',
-                        selectedColor: const Color(0xFF4F46E5),
-                        labelStyle: TextStyle(
-                          color: _provSelectedSat == 'sat3' ? Colors.white : Colors.grey,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 11,
-                        ),
-                        onSelected: (val) {
-                          if (val) setState(() => _provSelectedSat = 'sat3');
-                        },
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 18),
-
-                  ElevatedButton.icon(
-                    onPressed: _isProvisioning ? null : _runDirectProvisioning,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF10B981),
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    ),
-                    icon: _isProvisioning
-                        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                        : const Icon(Icons.rocket_launch, color: Colors.white),
-                    label: Text(
-                      _isProvisioning ? 'Desbloqueando y Vinculando Satélite...' : 'Vincular Dispositivo Mesh Ahora',
-                      style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ],
+          ],
+        ),
+      ),
     );
   }
 }
