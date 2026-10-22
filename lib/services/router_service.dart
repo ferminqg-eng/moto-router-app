@@ -6,12 +6,16 @@ import 'package:dartssh2/dartssh2.dart';
 class RouterStatus {
   final String ip;
   final String model;
+  final String hostname;
+  final bool minimStopped;
   final int uptimeSeconds;
   final List<ConnectedClient> clients;
 
   RouterStatus({
     required this.ip,
     required this.model,
+    this.hostname = 'Router Principal',
+    this.minimStopped = true,
     required this.uptimeSeconds,
     required this.clients,
   });
@@ -201,10 +205,12 @@ class RouterService {
     }
   }
 
-  /// Lee estado general, modelo y dispositivos conectados
+  /// Lee estado general, modelo, hostname, estado de Minim y clientes conectados
   static Future<RouterStatus> getStatus(String ip, String password) async {
     const script = '''
       echo "===UPTIME===" && cat /proc/uptime
+      echo "===HOSTNAME===" && (cat /proc/sys/kernel/hostname 2>/dev/null || uci -q get system.@system[0].hostname || echo "Router Principal")
+      echo "===MINIM===" && (pgrep minim || pgrep minimd || ps | grep -E "minim|minimd" | grep -v grep || echo "STOPPED")
       echo "===LEASES===" && cat /tmp/dhcp.leases 2>/dev/null || cat /var/dhcp.leases 2>/dev/null
       echo "===ARP===" && cat /proc/net/arp 2>/dev/null
       echo "===MODEL===" && cat /tmp/sysinfo/model 2>/dev/null || cat /proc/cpuinfo | grep -m1 'model name'
@@ -215,6 +221,8 @@ class RouterService {
 
     int uptime = 0;
     String model = 'Motorola MH7601';
+    String hostname = 'Router Principal';
+    bool minimStopped = true;
     List<ConnectedClient> clients = [];
 
     for (int i = 1; i < parts.length; i += 2) {
@@ -224,6 +232,10 @@ class RouterService {
       if (tag == 'UPTIME') {
         final secStr = content.split(' ').first;
         uptime = double.tryParse(secStr)?.toInt() ?? 0;
+      } else if (tag == 'HOSTNAME') {
+        if (content.isNotEmpty) hostname = content.split('\n').first.trim();
+      } else if (tag == 'MINIM') {
+        minimStopped = content.contains('STOPPED') || content.isEmpty;
       } else if (tag == 'MODEL') {
         final clean = content.replaceAll(RegExp(r'model name\s*:\s*'), '').trim();
         model = clean.isNotEmpty ? clean : 'Motorola MH7601 (AX1800)';
@@ -259,7 +271,49 @@ class RouterService {
       }
     }
 
-    return RouterStatus(ip: ip, model: model, uptimeSeconds: uptime, clients: clients);
+    return RouterStatus(
+      ip: ip,
+      model: model,
+      hostname: hostname,
+      minimStopped: minimStopped,
+      uptimeSeconds: uptime,
+      clients: clients,
+    );
+  }
+
+  /// Cambia el nombre del equipo (Hostname)
+  static Future<void> setHostname(String ip, String password, String hostname) async {
+    final clean = hostname.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
+    final cleanHost = clean.replaceAll(RegExp(r'\s+'), '-');
+    final script = '''
+      uci set system.@system[0].hostname='$cleanHost'
+      uci commit system
+      echo '$cleanHost' > /proc/sys/kernel/hostname
+      /etc/init.d/system reload 2>/dev/null || true
+    ''';
+    await executeSSH(ip, password, script);
+  }
+
+  /// Detiene y deshabilita el agente Minim Cloud para siempre
+  static Future<void> disableMinim(String ip, String password) async {
+    const script = '''
+      /etc/init.d/minim stop 2>/dev/null || true
+      /etc/init.d/minim disable 2>/dev/null || true
+      killall minim 2>/dev/null || true
+      killall minimd 2>/dev/null || true
+    ''';
+    await executeSSH(ip, password, script);
+  }
+
+  /// Reinicia el router de forma remota
+  static Future<void> rebootRouter(String ip, String password) async {
+    const script = '''
+      (sleep 1 && reboot) &
+      echo "REBOOT_INITIATED"
+    ''';
+    try {
+      await executeSSH(ip, password, script);
+    } catch (_) {}
   }
 
   /// Lee la configuración Wi-Fi actual del router, incluyendo potencia y cifrado
@@ -338,14 +392,21 @@ class RouterService {
   }
 
   /// Aplica cambios Wi-Fi (bandas, cifrado, potencia de transmisión y modo legacy Wi-Fi 6)
+  /// Apaga Minim primero y fuerza el reinicio real de los drivers Broadcom
   static Future<void> saveWifiConfig(String ip, String password, WifiConfigData cfg) async {
     final commands = <String>[];
 
-    // 1. Ajustar potencia de transmisión (Tx Power) en ambos radios (2.4 y 5 GHz)
+    // 1. Apagar Minim para evitar que sobreescriba cambios locales
+    commands.add("/etc/init.d/minim stop 2>/dev/null || true");
+    commands.add("/etc/init.d/minim disable 2>/dev/null || true");
+    commands.add("killall minim 2>/dev/null || true");
+    commands.add("killall minimd 2>/dev/null || true");
+
+    // 2. Ajustar potencia de transmisión (Tx Power) en ambos radios (2.4 y 5 GHz)
     commands.add("uci -q set wireless.radio0.txpower='${cfg.txPower}'");
     commands.add("uci -q set wireless.radio1.txpower='${cfg.txPower}'");
 
-    // 2. Modo de compatibilidad para clientes sin Wi-Fi 6 (Desactivar 802.11ax en 2.4 GHz)
+    // 3. Modo de compatibilidad para clientes sin Wi-Fi 6 (Desactivar 802.11ax en 2.4 GHz)
     if (cfg.legacyMode) {
       commands.add("uci -q set wireless.radio0.legacy_mode='1'");
       commands.add("uci -q set wireless.radio0.hwmode='11g'");
@@ -357,44 +418,46 @@ class RouterService {
       commands.add("uci -q set wireless.radio0.htmode='HE40'");
     }
 
-    // 3. Configurar interfaces inalámbricas (SSID, Clave, Cifrado, Roaming 802.11r)
+    // 4. Configurar interfaces inalámbricas (SSID, Clave, Cifrado)
     if (cfg.separateBands) {
       // 2.4 GHz y 5 GHz independientes
       commands.add('''
         for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
           dev=\$(uci -q get wireless.\${iface}.device)
           if echo "\$dev" | grep -qE "5|wlan1|radio1"; then
-            uci set wireless.\${iface}.ssid='${cfg.ssid5}'
-            uci set wireless.\${iface}.key='${cfg.key5}'
+            ${cfg.ssid5.isNotEmpty ? "uci set wireless.\${iface}.ssid='${cfg.ssid5}'" : ""}
+            ${cfg.key5.isNotEmpty ? "uci set wireless.\${iface}.key='${cfg.key5}'" : ""}
             uci set wireless.\${iface}.encryption='${cfg.enc5}'
           else
-            uci set wireless.\${iface}.ssid='${cfg.ssid24}'
-            uci set wireless.\${iface}.key='${cfg.key24}'
+            ${cfg.ssid24.isNotEmpty ? "uci set wireless.\${iface}.ssid='${cfg.ssid24}'" : ""}
+            ${cfg.key24.isNotEmpty ? "uci set wireless.\${iface}.key='${cfg.key24}'" : ""}
             uci set wireless.\${iface}.encryption='${cfg.enc24}'
           fi
           uci set wireless.\${iface}.disabled='0'
-          uci set wireless.\${iface}.ieee80211r='1'
-          uci set wireless.\${iface}.mobility_domain='4f54'
         done
       ''');
     } else {
-      // Banda Unificada (Mesh Roaming)
+      // Banda Unificada
       commands.add('''
         for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
-          uci set wireless.\${iface}.ssid='${cfg.ssid24}'
-          uci set wireless.\${iface}.key='${cfg.key24}'
+          ${cfg.ssid24.isNotEmpty ? "uci set wireless.\${iface}.ssid='${cfg.ssid24}'" : ""}
+          ${cfg.key24.isNotEmpty ? "uci set wireless.\${iface}.key='${cfg.key24}'" : ""}
           uci set wireless.\${iface}.encryption='${cfg.enc24}'
           uci set wireless.\${iface}.disabled='0'
-          uci set wireless.\${iface}.ieee80211r='1'
-          uci set wireless.\${iface}.mobility_domain='4f54'
         done
       ''');
     }
 
+    // 5. Commit y reinicio real en segundo plano
     commands.add('uci commit wireless');
-    commands.add('wifi reload 2>/dev/null || wifi 2>/dev/null || true');
+    commands.add('(/etc/init.d/network restart) &');
+    commands.add('(sleep 2 && wifi down && sleep 1 && wifi up) &');
 
-    await executeSSH(ip, password, commands.join('\n'));
+    try {
+      await executeSSH(ip, password, commands.join('\n'));
+    } catch (_) {
+      // El reinicio de la interfaz de red cierra la sesión SSH normalmente
+    }
   }
 
   /// Mide la calidad de conexión entre el router principal y un satélite
@@ -476,9 +539,12 @@ class RouterService {
       uci -q set wireless.radio0.txpower='$txPower'
       uci -q set wireless.radio1.txpower='$txPower'
       uci commit wireless
-      wifi reload 2>/dev/null || wifi 2>/dev/null || true
+      (/etc/init.d/network restart) &
+      (sleep 2 && wifi down && sleep 1 && wifi up) &
     ''';
-    await executeSSH(satIp, satPassword, script);
+    try {
+      await executeSSH(satIp, satPassword, script);
+    } catch (_) {}
   }
 
   /// Lee configuración actual de DHCP, DNS e IP de LAN
@@ -808,7 +874,8 @@ class RouterService {
     return results;
   }
 
-  /// Aprovisionamiento Guiado Directo del Satélite (Híbrido: Universal Bridge + Wi-Fi Mesh + 802.11r)
+  /// Aprovisionamiento Guiado Inalámbrico del Satélite desde el teléfono
+  /// (Conectado a la red de fábrica en 192.168.1.1)
   static Future<void> provisionSatelliteDirect({
     required String satIp,
     required String satPassword,
@@ -816,24 +883,38 @@ class RouterService {
     required String mainGateway,
     required String mainSsid,
     required String mainKey,
-    String connectionMode = 'hybrid',
+    String satName = 'Equipo Satélite',
   }) async {
     // PASO 1: Desbloquear LuCI y arrancar Dropbear SSH en el satélite
     final unlocked = await unlockRouter(satIp, satPassword);
     if (!unlocked) {
-      throw Exception('No se pudo desbloquear el satélite en $satIp. Verifica que tu teléfono esté conectado a su red Wi-Fi o cable y que la clave de etiqueta sea correcta.');
+      throw Exception('No se pudo desbloquear el satélite en $satIp. Verifica que tu teléfono esté conectado a su red Wi-Fi y que la clave de etiqueta sea correcta.');
     }
     await Future.delayed(const Duration(seconds: 3));
 
-    // PASO 2: Configuración híbrida completa (Puertos unificados en Switch + Wi-Fi Backhaul + Roaming 802.11r)
+    final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
+    final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
+
+    // PASO 2: Configuración híbrida completa (Switch + Wi-Fi Backhaul + Hostname + Sin Minim)
     final script = '''
-      # 1. Unificar puertos WAN (eth1) y LAN (eth0) en br-lan (Switch transparente sin bloqueo)
+      # 1. Nombre del Satélite
+      uci set system.@system[0].hostname='$cleanHost'
+      echo '$cleanHost' > /proc/sys/kernel/hostname
+      uci commit system
+
+      # 2. Desactivar Minim para siempre
+      /etc/init.d/minim stop 2>/dev/null || true
+      /etc/init.d/minim disable 2>/dev/null || true
+      killall minim 2>/dev/null || true
+      killall minimd 2>/dev/null || true
+
+      # 3. Unificar puertos WAN (eth1) y LAN (eth0) en br-lan (Switch transparente sin bloqueo)
       uci -q delete network.wan
       uci -q delete network.wan6
       uci -q set network.lan.ifname='eth0 eth1'
       uci -q set network.lan.type='bridge'
 
-      # 2. Configurar IP fija final y Puerta de enlace al Router Principal
+      # 4. Configurar IP fija final y Puerta de enlace al Router Principal
       uci set network.lan.ipaddr='$targetIp'
       uci set network.lan.netmask='255.255.255.0'
       uci set network.lan.gateway='$mainGateway'
@@ -841,25 +922,21 @@ class RouterService {
       uci add_list network.lan.dns='$mainGateway'
       uci commit network
 
-      # 3. Apagar Servidor DHCP y dnsmasq para evitar conflictos de IP
+      # 5. Apagar Servidor DHCP y dnsmasq para evitar conflictos de IP
       uci set dhcp.lan.ignore='1'
       uci commit dhcp
       /etc/init.d/dnsmasq stop 2>/dev/null || true
       /etc/init.d/dnsmasq disable 2>/dev/null || true
 
-      # 4. Clonar emisión Wi-Fi con Fast Roaming 802.11r (misma red y contraseña)
+      # 6. Clonar emisión Wi-Fi (misma red y contraseña)
       for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
         ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
         ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
         uci set wireless.\${iface}.encryption='psk2'
         uci set wireless.\${iface}.disabled='0'
-        uci set wireless.\${iface}.ieee80211r='1'
-        uci set wireless.\${iface}.mobility_domain='4f54'
-        uci set wireless.\${iface}.ft_over_ds='0'
-        uci set wireless.\${iface}.ft_psk_generate_local='1'
       done
 
-      # 5. Configurar enlace cliente inalámbrico de retorno (Mesh STA Backhaul)
+      # 7. Configurar enlace cliente inalámbrico de retorno (Mesh STA Backhaul)
       ${(mainSsid.isNotEmpty && mainKey.isNotEmpty) ? """
       uci -q delete wireless.mesh_sta
       uci set wireless.mesh_sta=wifi-iface
@@ -872,11 +949,9 @@ class RouterService {
       """ : ""}
       uci commit wireless
 
-      # 6. Desactivar Minim y aplicar cambios de red
-      /etc/init.d/minim stop 2>/dev/null || true
-      /etc/init.d/minim disable 2>/dev/null || true
-      /etc/init.d/network restart &
-      wifi reload 2>/dev/null || wifi 2>/dev/null || true
+      # 8. Reiniciar red y drivers Broadcom
+      (/etc/init.d/network restart) &
+      (sleep 2 && wifi down && sleep 1 && wifi up) &
     ''';
 
     try {
