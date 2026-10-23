@@ -41,6 +41,7 @@ class MeshNode {
   String ip;
   String mac;
   String password;
+  String backhaulBand;
   int txPower;
   SatelliteQuality? quality;
   bool isChecking;
@@ -50,6 +51,7 @@ class MeshNode {
     required this.ip,
     this.mac = '',
     this.password = '',
+    this.backhaulBand = '2.4 GHz',
     this.txPower = 23,
     this.quality,
     this.isChecking = false,
@@ -60,6 +62,7 @@ class MeshNode {
     'ip': ip,
     'mac': mac,
     'password': password,
+    'backhaulBand': backhaulBand,
     'txPower': txPower,
   };
 
@@ -68,6 +71,7 @@ class MeshNode {
     ip: json['ip'] ?? '192.168.1.2',
     mac: json['mac'] ?? '',
     password: json['password'] ?? '',
+    backhaulBand: json['backhaulBand'] ?? '2.4 GHz',
     txPower: json['txPower'] ?? 23,
   );
 }
@@ -123,6 +127,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   final TextEditingController _addSatNameController = TextEditingController(text: 'Satélite 1');
   final TextEditingController _addSatPassController = TextEditingController();
   bool _addSatPassObscure = true;
+  String _selectedBackhaulBand = '2.4 GHz';
   String _calculatedNextIp = '192.168.1.2';
   bool _isCalculatingIp = false;
   bool _isProvisioningSat = false;
@@ -754,6 +759,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         satName: satName,
         channel5: _mainChannel5,
         channel24: _mainChannel24,
+        backhaulBand: _selectedBackhaulBand,
         onProgress: (step, percent) {
           if (mounted && setModalState != null) {
             setModalState!(() {
@@ -769,8 +775,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         _meshNodes[existingIdx].name = satName;
         _meshNodes[existingIdx].mac = satMac;
         _meshNodes[existingIdx].password = satPass;
+        _meshNodes[existingIdx].backhaulBand = _selectedBackhaulBand;
       } else {
-        _meshNodes.add(MeshNode(name: satName, ip: targetIp, mac: satMac, password: satPass));
+        _meshNodes.add(MeshNode(name: satName, ip: targetIp, mac: satMac, password: satPass, backhaulBand: _selectedBackhaulBand));
       }
       await _persistMeshNodes();
       await _calculateNextIp();
@@ -1338,7 +1345,61 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     }
   }
 
-  // TAB 3: Editar IP manualmente
+  // TAB 3: Cambiar Banda de Enlace Backhaul (2.4 GHz vs 5 GHz)
+  Future<void> _switchNodeBackhaulBand(MeshNode node) async {
+    final currentIs24 = !node.backhaulBand.contains('5');
+    final targetBand = currentIs24 ? '5 GHz' : '2.4 GHz';
+    final explanation = currentIs24
+        ? 'Cambiar a 5 GHz brindará MAYOR VELOCIDAD, pero tiene MENOR PENETRACIÓN a través de paredes de concreto.\n\nIdeal si el satélite está en línea de vista o a corta distancia.'
+        : 'Cambiar a 2.4 GHz brindará MÁXIMO ALCANCE Y ATRAVIESA PAREDES de concreto con alta estabilidad.\n\nIdeal para casas y habitaciones separadas por muros gruesos.';
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: Text('Cambiar Enlace a $targetBand', style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+        content: Text(
+          '$explanation\n\n¿Deseas aplicar el cambio en ${node.name} (${node.ip}) ahora?',
+          style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.4),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: currentIs24 ? const Color(0xFF6366F1) : const Color(0xFF10B981),
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('Cambiar a $targetBand', style: const TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      final pass = node.password.isNotEmpty ? node.password : _currentPassword;
+      final mainSsid = _ssid24Controller.text.trim().isNotEmpty ? _ssid24Controller.text.trim() : 'Motorolamesh';
+      final mainKey = _key24Controller.text.trim();
+
+      _showSnack('Reconfigurando enlace a $targetBand en ${node.name}...');
+      try {
+        await RouterService.switchSatelliteBackhaulBand(
+          satIp: node.ip,
+          satPassword: pass,
+          mainGateway: _currentIp,
+          mainSsid: mainSsid,
+          mainKey: mainKey,
+          targetBand: targetBand,
+        );
+        setState(() => node.backhaulBand = targetBand);
+        await _persistMeshNodes();
+        _showSnack('✔ Enlace cambiado a $targetBand. El satélite se está reiniciando...');
+      } catch (e) {
+        _showSnack('Error al cambiar enlace: $e', isError: true);
+      }
+    }
+  }
+
+    // TAB 3: Editar IP manualmente
   Future<void> _editNodeIp(MeshNode node) async {
     final ctrl = TextEditingController(text: node.ip);
     final newIp = await showDialog<String>(
@@ -2260,6 +2321,35 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     prefixIcon: Icon(Icons.edit, color: Color(0xFF3B82F6)),
                   ),
                 ),
+
+                const SizedBox(height: 14),
+
+                // Selector de Banda de Enlace (Backhaul Mesh)
+                const Text('Banda de Enlace entre Routers (Backhaul):', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white70)),
+                const SizedBox(height: 6),
+                DropdownButtonFormField<String>(
+                  value: _selectedBackhaulBand,
+                  dropdownColor: const Color(0xFF1E293B),
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                    prefixIcon: Icon(Icons.settings_input_antenna, color: Color(0xFF38BDF8)),
+                  ),
+                  items: const [
+                    DropdownMenuItem(
+                      value: '2.4 GHz',
+                      child: Text('🟢 2.4 GHz - Máximo Alcance (Atraviesa Paredes de Concreto)'),
+                    ),
+                    DropdownMenuItem(
+                      value: '5 GHz',
+                      child: Text('⚡ 5 GHz - Máxima Velocidad (Habitaciones Cercanas)'),
+                    ),
+                  ],
+                  onChanged: (val) {
+                    if (val != null) setState(() => _selectedBackhaulBand = val);
+                  },
+                ),
               ],
             ),
           ),
@@ -2500,20 +2590,52 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     ],
                   ),
                 ),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: isOnline ? const Color(0xFF10B981).withOpacity(0.2) : Colors.redAccent.withOpacity(0.2),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Text(
-                    isOnline ? 'En Línea' : 'Desconectado',
-                    style: TextStyle(
-                      fontSize: 11,
-                      fontWeight: FontWeight.bold,
-                      color: isOnline ? const Color(0xFF34D399) : Colors.redAccent,
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: isOnline ? const Color(0xFF10B981).withOpacity(0.2) : Colors.redAccent.withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Text(
+                        isOnline ? 'En Línea' : 'Desconectado',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          color: isOnline ? const Color(0xFF34D399) : Colors.redAccent,
+                        ),
+                      ),
                     ),
-                  ),
+                    const SizedBox(height: 4),
+                    InkWell(
+                      onTap: () => _switchNodeBackhaulBand(node),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: node.backhaulBand.contains('5') ? const Color(0xFF6366F1).withOpacity(0.2) : const Color(0xFF10B981).withOpacity(0.2),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: node.backhaulBand.contains('5') ? const Color(0xFF818CF8) : const Color(0xFF34D399), width: 1),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              node.backhaulBand.contains('5') ? '⚡ 5 GHz' : '🟢 2.4 GHz',
+                              style: TextStyle(
+                                fontSize: 9,
+                                fontWeight: FontWeight.bold,
+                                color: node.backhaulBand.contains('5') ? const Color(0xFFA5B4FC) : const Color(0xFF6EE7B7),
+                              ),
+                            ),
+                            const SizedBox(width: 3),
+                            const Icon(Icons.swap_horiz, size: 11, color: Colors.white70),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
