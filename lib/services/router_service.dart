@@ -21,6 +21,36 @@ class RouterStatus {
   });
 }
 
+class DhcpLeaseEntry {
+  final String hostname;
+  final String ip;
+  final String mac;
+  final int expiresTimestamp;
+  final bool isStatic;
+
+  DhcpLeaseEntry({
+    required this.hostname,
+    required this.ip,
+    required this.mac,
+    required this.expiresTimestamp,
+    this.isStatic = false,
+  });
+
+  String get expirationFormatted {
+    if (expiresTimestamp <= 0) return 'Concesión Estática / Permanente';
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final diff = expiresTimestamp - now;
+    if (diff <= 0) return 'Concesión Expirada';
+    final hours = diff ~/ 3600;
+    final minutes = (diff % 3600) ~/ 60;
+    if (hours > 0) {
+      return '$hours h $minutes min restantes';
+    } else {
+      return '$minutes min restantes';
+    }
+  }
+}
+
 class ConnectedClient {
   final String mac;
   final String ip;
@@ -205,7 +235,7 @@ class RouterService {
         }
       }
 
-      return true;
+      return false; // Error real si el puerto 22 no abrió
     } finally {
       client.close();
     }
@@ -728,6 +758,70 @@ class RouterService {
     await executeSSH(ip, password, commands.join('\n'));
   }
 
+  /// Obtiene la lista completa de concesiones DHCP activas (leases) y tabla ARP
+  static Future<List<DhcpLeaseEntry>> getDhcpLeases(String ip, String password) async {
+    const script = '''
+      echo "===LEASES===" && cat /tmp/dhcp.leases 2>/dev/null || cat /var/dhcp.leases 2>/dev/null
+      echo "===ARP===" && cat /proc/net/arp 2>/dev/null
+    ''';
+
+    final output = await executeSSH(ip, password, script);
+    final parts = output.split('===');
+    String leasesRaw = '';
+    String arpRaw = '';
+
+    for (int i = 1; i < parts.length; i += 2) {
+      final tag = parts[i].trim();
+      final body = i + 1 < parts.length ? parts[i + 1] : '';
+      if (tag == 'LEASES') leasesRaw = body;
+      if (tag == 'ARP') arpRaw = body;
+    }
+
+    final Map<String, DhcpLeaseEntry> map = {};
+
+    for (final line in leasesRaw.split('\n')) {
+      final tokens = line.trim().split(RegExp(r'\s+'));
+      if (tokens.length >= 4) {
+        final exp = int.tryParse(tokens[0]) ?? 0;
+        final mac = tokens[1].toUpperCase();
+        final clientIp = tokens[2];
+        final host = (tokens[3] == '*' || tokens[3].isEmpty) ? 'Dispositivo' : tokens[3];
+        map[clientIp] = DhcpLeaseEntry(
+          hostname: host,
+          ip: clientIp,
+          mac: mac,
+          expiresTimestamp: exp,
+        );
+      }
+    }
+
+    // Complementar con ARP
+    for (final line in arpRaw.split('\n')) {
+      final tokens = line.trim().split(RegExp(r'\s+'));
+      if (tokens.length >= 4 && tokens[0].contains('.') && tokens[3].contains(':') && tokens[3] != '00:00:00:00:00:00') {
+        final arpIp = tokens[0];
+        final arpMac = tokens[3].toUpperCase();
+        if (!map.containsKey(arpIp)) {
+          map[arpIp] = DhcpLeaseEntry(
+            hostname: 'Dispositivo Red (ARP)',
+            ip: arpIp,
+            mac: arpMac,
+            expiresTimestamp: 0,
+            isStatic: true,
+          );
+        }
+      }
+    }
+
+    final list = map.values.toList();
+    list.sort((a, b) {
+      final lastA = int.tryParse(a.ip.split('.').last) ?? 0;
+      final lastB = int.tryParse(b.ip.split('.').last) ?? 0;
+      return lastA.compareTo(lastB);
+    });
+    return list;
+  }
+
   /// Guarda la dirección IP de LAN, máscara de subred y Gateway
   static Future<void> saveLanIpConfig(String ip, String password, {
     required String newIp,
@@ -1245,7 +1339,7 @@ EOF
     } catch (_) {}
   }
 
-  /// Aprovisionamiento Guiado Inalámbrico del Satélite desde el teléfono
+  /// Aprovisionamiento Guiado Directo del Satélite desde el teléfono
   /// (Conectado a la red de fábrica en 192.168.1.1)
   /// Alinea canales con router principal, activa WDS bidireccional, clona NVRAM y unifica br-lan
   static Future<void> provisionSatelliteDirect({
@@ -1259,16 +1353,21 @@ EOF
     int channel5 = 36,
     int channel24 = 6,
     String mainBssid = '',
+    void Function(String step, double progress)? onProgress,
   }) async {
-    // PASO 1: Desbloquear LuCI y arrancar Dropbear SSH en el satélite
+    onProgress?.call('Conectando a LuCI en $satIp y arrancando Dropbear SSH...', 0.20);
     final unlocked = await unlockRouter(satIp, satPassword);
     if (!unlocked) {
-      throw Exception('No se pudo desbloquear el satélite en $satIp. Verifica que tu teléfono esté conectado a su red Wi-Fi y que la clave de etiqueta sea correcta.');
+      throw Exception('No se pudo desbloquear el satélite en $satIp. Verifica que tu teléfono esté conectado a la red Wi-Fi de fábrica de ese satélite y que la contraseña de etiqueta sea correcta.');
     }
-    await Future.delayed(const Duration(seconds: 3));
+    
+    onProgress?.call('Verificando acceso SSH en puerto 22...', 0.40);
+    await Future.delayed(const Duration(seconds: 2));
 
     final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
     final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
+
+    onProgress?.call('Inyectando configuración Mesh WDS, canales y nueva IP $targetIp...', 0.65);
 
     // PASO 2: Configuración Mesh WDS completa
     final script = '''
@@ -1412,9 +1511,25 @@ EOF
 
     try {
       await executeSSH(satIp, satPassword, script);
-    } catch (_) {
-      // El cambio de IP desconecta la sesión SSH normalmente
+    } catch (e) {
+      final err = e.toString().toLowerCase();
+      if (!err.contains('closed') && !err.contains('reset') && !err.contains('broken pipe') && !err.contains('socketexception')) {
+        throw Exception('Fallo al aplicar la configuración en el satélite: $e');
+      }
     }
+
+    onProgress?.call('¡Configuración aplicada! El satélite se está reiniciando...', 1.0);
+  }
+
+  /// Restablece un satélite a sus valores de fábrica de forma remota (Hard Reset)
+  static Future<void> factoryResetSatellite(String ip, String password) async {
+    const script = '''
+      (sleep 1; firstboot -y 2>/dev/null || jffs2reset -y 2>/dev/null; reboot -f) &
+      echo "RESET_INITIATED"
+    ''';
+    try {
+      await executeSSH(ip, password, script);
+    } catch (_) {}
   }
 
   /// Restablece el equipo a los valores de fábrica predeterminados (Reset Default)
