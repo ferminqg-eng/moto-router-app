@@ -446,7 +446,7 @@ class RouterService {
   static Future<void> saveWifiConfig(String ip, String password, WifiConfigData cfg) async {
     final commands = <String>[];
 
-    // 1. Apagar y neutralizar permanentemente unum/minim
+    // 1. Apagar y neutralizar permanentemente unum/minim de forma limpia sin romper procd
     commands.add('''
       /etc/init.d/unum stop 2>/dev/null || true
       /etc/init.d/unum disable 2>/dev/null || true
@@ -455,7 +455,9 @@ class RouterService {
       killall -9 unum 2>/dev/null || true
       killall -9 minim 2>/dev/null || true
       killall -9 minimd 2>/dev/null || true
-      chmod 644 /usr/bin/unum 2>/dev/null || true
+      echo '#!/bin/sh' > /usr/bin/unum 2>/dev/null || true
+      echo 'exit 0' >> /usr/bin/unum 2>/dev/null || true
+      chmod 755 /usr/bin/unum 2>/dev/null || true
       rm -f /tmp/provision_info.json 2>/dev/null || true
     ''');
 
@@ -466,7 +468,7 @@ class RouterService {
     final key5 = cfg.separateBands ? cfg.key5 : cfg.key24;
     final enc5 = cfg.separateBands ? cfg.enc5 : cfg.enc24;
 
-    // 2. Persistir en NVRAM (Broadcom wl carga de aquí en boot) y activar WDS
+    // 2. Persistir en NVRAM (Broadcom wl carga de aquí en boot) sin corromper wl0_wds
     commands.add('''
       if which nvram >/dev/null 2>&1; then
         ${ssid24.isNotEmpty ? "nvram set wl0_ssid='$ssid24'" : ""}
@@ -481,8 +483,8 @@ class RouterService {
         nvram set wl1_txpwr='${cfg.txPower}'
         nvram set wl0_lazywds='1'
         nvram set wl1_lazywds='1'
-        nvram set wl0_wds='1'
-        nvram set wl1_wds='1'
+        nvram unset wl0_wds 2>/dev/null || true
+        nvram unset wl1_wds 2>/dev/null || true
         nvram commit 2>/dev/null || true
       fi
     ''');
@@ -499,11 +501,11 @@ class RouterService {
       wl -i wl1 lazywds 1 2>/dev/null || true
     ''');
 
-    // 4. Ajustar potencia, modo legacy y WDS en OpenWrt UCI
+    // 4. Ajustar potencia y modo legacy en OpenWrt UCI
     commands.add("uci -q set wireless.radio0.txpower='${cfg.txPower}'");
     commands.add("uci -q set wireless.radio1.txpower='${cfg.txPower}'");
-    commands.add("uci -q set wireless.radio0.wds='1'");
-    commands.add("uci -q set wireless.radio1.wds='1'");
+    commands.add("uci -q delete wireless.radio0.wds");
+    commands.add("uci -q delete wireless.radio1.wds");
 
     if (cfg.legacyMode) {
       commands.add("uci -q set wireless.radio0.legacy_mode='1'");
@@ -531,7 +533,7 @@ class RouterService {
             uci set wireless.\${iface}.encryption='$enc24'
           fi
           uci set wireless.\${iface}.disabled='0'
-          uci set wireless.\${iface}.wds='1'
+          uci -q delete wireless.\${iface}.wds
         done
       ''');
     } else {
@@ -541,14 +543,16 @@ class RouterService {
           ${key24.isNotEmpty ? "uci set wireless.\${iface}.key='$key24'" : ""}
           uci set wireless.\${iface}.encryption='$enc24'
           uci set wireless.\${iface}.disabled='0'
-          uci set wireless.\${iface}.wds='1'
+          uci -q delete wireless.\${iface}.wds
         done
       ''');
     }
 
-    // 6. Commit y reinicio limpio automático para aplicar NVRAM y radios sin congelar el kernel
+    // 6. Commit, flush de memoria y reinicio limpio automático
     commands.add('uci commit wireless');
-    commands.add('(sleep 1 && reboot) &');
+    commands.add('sync');
+    commands.add('sync');
+    commands.add('(sleep 2 && reboot) &');
 
     try {
       await executeSSH(ip, password, commands.join('\n'));
@@ -915,7 +919,7 @@ class RouterService {
                          mac.startsWith('C8:C7:50') ||
                          mac.startsWith('00:0C:E7') ||
                          mac.startsWith('14:59:C0');
-          if (ssid == 'Red Oculta' && isMoto) ssid = 'Nodo Motorola Mesh';
+          if (ssid == 'Red Oculta' && isMoto) ssid = 'Red Oculta (Motorola)';
           if (!results.any((r) => r.mac == mac)) {
             results.add(WirelessScanResult(
               mac: mac,
@@ -952,7 +956,7 @@ class RouterService {
                          mac.startsWith('C8:C7:50') ||
                          mac.startsWith('00:0C:E7') ||
                          mac.startsWith('14:59:C0');
-          if (ssid == 'Red Oculta' && isMoto) ssid = 'Nodo Motorola Mesh';
+          if (ssid == 'Red Oculta' && isMoto) ssid = 'Red Oculta (Motorola)';
           if (!results.any((r) => r.mac == mac)) {
             results.add(WirelessScanResult(
               mac: mac,
@@ -998,7 +1002,7 @@ class RouterService {
 
     // PASO 2: Configuración Mesh WDS completa
     final script = '''
-      # 1. Neutralizar completamente el agente de nube unum/minim
+      # 1. Neutralizar completamente el agente de nube unum/minim de forma segura sin romper procd
       /etc/init.d/unum stop 2>/dev/null || true
       /etc/init.d/unum disable 2>/dev/null || true
       /etc/init.d/minim stop 2>/dev/null || true
@@ -1006,7 +1010,9 @@ class RouterService {
       killall -9 unum 2>/dev/null || true
       killall -9 minim 2>/dev/null || true
       killall -9 minimd 2>/dev/null || true
-      chmod 644 /usr/bin/unum 2>/dev/null || true
+      echo '#!/bin/sh' > /usr/bin/unum 2>/dev/null || true
+      echo 'exit 0' >> /usr/bin/unum 2>/dev/null || true
+      chmod 755 /usr/bin/unum 2>/dev/null || true
       rm -f /tmp/provision_info.json 2>/dev/null || true
 
       # 2. Nombre del Satélite
@@ -1017,10 +1023,10 @@ class RouterService {
       # 3. Canales Wi-Fi: ALINEAR EXACTAMENTE CON EL ROUTER PRINCIPAL
       uci -q set wireless.radio0.channel='$channel24'
       uci -q set wireless.radio1.channel='$channel5'
-      uci -q set wireless.radio0.wds='1'
-      uci -q set wireless.radio1.wds='1'
+      uci -q delete wireless.radio0.wds
+      uci -q delete wireless.radio1.wds
 
-      # 4. Persistir en NVRAM del satélite y activar WDS
+      # 4. Persistir en NVRAM del satélite (sin corromper wl0_wds con valores inválidos)
       if which nvram >/dev/null 2>&1; then
         nvram set router_name='$cleanHost'
         ${mainSsid.isNotEmpty ? "nvram set wl0_ssid='$mainSsid'" : ""}
@@ -1035,9 +1041,8 @@ class RouterService {
         nvram set wl1_channel='$channel5'
         nvram set wl0_lazywds='1'
         nvram set wl1_lazywds='1'
-        nvram set wl0_wds='1'
-        nvram set wl1_wds='1'
-        ${mainBssid.isNotEmpty ? "nvram set wl1_wds='$mainBssid'" : ""}
+        nvram unset wl0_wds 2>/dev/null || true
+        nvram unset wl1_wds 2>/dev/null || true
         nvram commit 2>/dev/null || true
       fi
 
@@ -1050,7 +1055,6 @@ class RouterService {
       ${mainKey.isNotEmpty ? "wl -i wl1 wpa_psk '$mainKey' 2>/dev/null || true" : ""}
       wl -i wl0 lazywds 1 2>/dev/null || true
       wl -i wl1 lazywds 1 2>/dev/null || true
-      ${mainBssid.isNotEmpty ? "wl -i wl1 wds '$mainBssid' 2>/dev/null || true" : ""}
 
       # 6. Unificar puertos WAN (eth1) y LAN (eth0) en br-lan (Modo Switch total transparente)
       uci -q delete network.wan
@@ -1072,25 +1076,34 @@ class RouterService {
       /etc/init.d/dnsmasq stop 2>/dev/null || true
       /etc/init.d/dnsmasq disable 2>/dev/null || true
 
-      # 9. Clonar emisión Wi-Fi en UCI con WDS
+      # 9. Clonar emisión Wi-Fi en UCI
       for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
         ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
         ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
         uci set wireless.\${iface}.encryption='psk2'
         uci set wireless.\${iface}.disabled='0'
-        uci set wireless.\${iface}.wds='1'
+        uci -q delete wireless.\${iface}.wds
       done
+
+      # 10. Configurar enlace cliente inalámbrico (Backhaul STA) en 5 GHz hacia el Router Principal
       uci -q delete wireless.mesh_sta
+      uci set wireless.mesh_sta=wifi-iface
+      uci set wireless.mesh_sta.device='radio1'
+      uci set wireless.mesh_sta.mode='sta'
+      uci set wireless.mesh_sta.network='lan'
+      ${mainSsid.isNotEmpty ? "uci set wireless.mesh_sta.ssid='$mainSsid'" : ""}
+      ${mainKey.isNotEmpty ? "uci set wireless.mesh_sta.key='$mainKey'" : ""}
+      uci set wireless.mesh_sta.encryption='psk2'
       uci commit wireless
 
-      # 10. Claves de enlace WDS en NVRAM
+      # 11. Claves de enlace WDS en NVRAM
       if which nvram >/dev/null 2>&1; then
-        nvram set wl0_wds_wpa_psk='$mainKey'
-        nvram set wl1_wds_wpa_psk='$mainKey'
+        ${mainKey.isNotEmpty ? "nvram set wl0_wds_wpa_psk='$mainKey'" : ""}
+        ${mainKey.isNotEmpty ? "nvram set wl1_wds_wpa_psk='$mainKey'" : ""}
         nvram commit 2>/dev/null || true
       fi
 
-      # 11. Script permanente de anexión automática WDS/mesh al bridge br-lan
+      # 12. Script permanente de anexión automática WDS/mesh al bridge br-lan
       mkdir -p /etc/hotplug.d/net
       cat << 'EOF' > /etc/hotplug.d/net/99-wds-bridge
       if echo "\$INTERFACE" | grep -qE "wds|wl"; then
@@ -1099,17 +1112,17 @@ class RouterService {
 EOF
       chmod +x /etc/hotplug.d/net/99-wds-bridge 2>/dev/null || true
 
-      # 12. Servicio Mesh Watchdog en arranque (Enlace continuo resiliente)
+      # 13. Servicio Mesh Watchdog en arranque (Enlace continuo resiliente)
       cat << 'EOF' > /etc/init.d/mesh_watchdog
 #!/bin/sh /etc/rc.common
 START=99
 start() {
   (
     while true; do
-      sleep 20
+      sleep 12
       if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
         wl -i wl1 wet 1 2>/dev/null || true
-        wl -i wl1 join '$mainSsid' 2>/dev/null || true
+        ${mainKey.isNotEmpty ? "wl -i wl1 join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i wl1 join '$mainSsid' 2>/dev/null || true"}
         for dev in \$(ifconfig -a | grep -E "wds|wl1" | awk '{print \$1}'); do
           brctl addif br-lan "\$dev" 2>/dev/null || true
         done
@@ -1121,7 +1134,9 @@ EOF
       chmod +x /etc/init.d/mesh_watchdog 2>/dev/null || true
       /etc/init.d/mesh_watchdog enable 2>/dev/null || true
 
-      # 13. Reinicio limpio del satélite para arrancar sin bloqueos en su nueva IP
+      # 14. Flush de memoria y reinicio limpio del satélite para arrancar sin bloqueos en su nueva IP
+      sync
+      sync
       (sleep 2 && reboot) &
     ''';
 
