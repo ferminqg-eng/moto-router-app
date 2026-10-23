@@ -1,7 +1,7 @@
 name: lan_router_management
 description: "App Android para gestión local Lan Router Management"
 publish_to: 'none'
-version: 2.6.5+14
+version: 2.7.0+15
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -14,6 +14,7 @@ dependencies:
   provider: ^6.1.2
   shared_preferences: ^2.2.2
   cupertino_icons: ^1.0.6
+  mobile_scanner: ^5.2.3
 
 dev_dependencies:
   flutter_test:
