@@ -1342,7 +1342,7 @@ EOF
   /// Aprovisionamiento Guiado Directo del Satélite desde el teléfono
   /// (Conectado a la red de fábrica en 192.168.1.1)
   /// Alinea canales con router principal, activa WDS bidireccional, clona NVRAM y unifica br-lan
-  static Future<void> provisionSatelliteDirect({
+  static Future<String> provisionSatelliteDirect({
     required String satIp,
     required String satPassword,
     required String targetIp,
@@ -1363,6 +1363,13 @@ EOF
     
     onProgress?.call('Verificando acceso SSH en puerto 22...', 0.40);
     await Future.delayed(const Duration(seconds: 2));
+
+    String satMac = '';
+    try {
+      final macOut = await executeSSH(satIp, satPassword, "cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/net/br-lan/address 2>/dev/null || wl -i wl0 cur_etheraddr 2>/dev/null || echo ''");
+      final match = RegExp(r'([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})').firstMatch(macOut);
+      if (match != null) satMac = match.group(0)!.toUpperCase();
+    } catch (_) {}
 
     final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
     final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
@@ -1519,6 +1526,7 @@ EOF
     }
 
     onProgress?.call('¡Configuración aplicada! El satélite se está reiniciando...', 1.0);
+    return satMac;
   }
 
   /// Restablece un satélite a sus valores de fábrica de forma remota (Hard Reset)
@@ -1539,5 +1547,78 @@ EOF
       echo "FACTORY_RESET_INITIATED"
     ''';
     await executeSSH(ip, password, script);
+  }
+
+  /// Agrega una reserva estática DHCP en el Router Principal para un satélite o dispositivo
+  static Future<void> addDhcpStaticReservation({
+    required String mainIp,
+    required String mainPassword,
+    required String mac,
+    required String targetIp,
+    required String hostname,
+  }) async {
+    final cleanHost = hostname.replaceAll(RegExp(r'\s+'), '-');
+    final cleanMac = mac.trim().toLowerCase();
+    final script = '''
+      for sec in \$(uci show dhcp | grep -E "=host" | cut -d'.' -f2 | cut -d'=' -f1); do
+        m=\$(uci -q get dhcp.\${sec}.mac)
+        ip=\$(uci -q get dhcp.\${sec}.ip)
+        if [ "\$m" = "$cleanMac" ] || [ "\$ip" = "$targetIp" ]; then
+          uci -q delete dhcp.\${sec}
+        fi
+      done
+      sec=\$(uci add dhcp host)
+      uci set dhcp.\${sec}.name='$cleanHost'
+      uci set dhcp.\${sec}.mac='$cleanMac'
+      uci set dhcp.\${sec}.ip='$targetIp'
+      uci commit dhcp
+      /etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/dnsmasq restart
+    ''';
+    await executeSSH(mainIp, mainPassword, script);
+  }
+
+  /// Asigna una IP estática directamente al satélite y configura la reserva en el router principal
+  static Future<void> fixSatelliteIp({
+    required String currentSatIp,
+    required String satPassword,
+    required String mainIp,
+    required String mainPassword,
+    required String targetIp,
+    required String satName,
+  }) async {
+    String satMac = '';
+    try {
+      final macOut = await executeSSH(currentSatIp, satPassword, "cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/net/br-lan/address 2>/dev/null || wl -i wl0 cur_etheraddr 2>/dev/null || echo ''");
+      final match = RegExp(r'([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})').firstMatch(macOut);
+      if (match != null) satMac = match.group(0)!.toUpperCase();
+    } catch (_) {}
+
+    if (satMac.isNotEmpty) {
+      try {
+        await addDhcpStaticReservation(
+          mainIp: mainIp,
+          mainPassword: mainPassword,
+          mac: satMac,
+          targetIp: targetIp,
+          hostname: satName,
+        );
+      } catch (_) {}
+    }
+
+    final script = '''
+      uci set network.lan.proto='static'
+      uci set network.lan.ipaddr='$targetIp'
+      uci set network.lan.netmask='255.255.255.0'
+      uci set network.lan.gateway='$mainIp'
+      uci -q delete network.lan.dns
+      uci add_list network.lan.dns='$mainIp'
+      uci commit network
+      sync
+      (/etc/init.d/network restart) &
+      (sleep 2 && reboot) &
+    ''';
+    try {
+      await executeSSH(currentSatIp, satPassword, script);
+    } catch (_) {}
   }
 }
