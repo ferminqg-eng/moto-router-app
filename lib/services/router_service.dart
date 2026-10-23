@@ -546,14 +546,14 @@ class RouterService {
       ''');
     }
 
-    // 6. Commit y reinicio del subsistema wireless
+    // 6. Commit y reinicio limpio automático para aplicar NVRAM y radios sin congelar el kernel
     commands.add('uci commit wireless');
-    commands.add('(wifi down 2>/dev/null; sleep 1; wifi up 2>/dev/null; /etc/init.d/network restart 2>/dev/null) &');
+    commands.add('(sleep 1 && reboot) &');
 
     try {
       await executeSSH(ip, password, commands.join('\n'));
     } catch (_) {
-      // El reinicio de la interfaz de red cierra la sesión SSH normalmente
+      // El reinicio cierra la sesión SSH normalmente
     }
   }
 
@@ -1083,20 +1083,46 @@ class RouterService {
       uci -q delete wireless.mesh_sta
       uci commit wireless
 
-      # 10. Script permanente de anexión automática WDS al bridge br-lan
+      # 10. Claves de enlace WDS en NVRAM
+      if which nvram >/dev/null 2>&1; then
+        nvram set wl0_wds_wpa_psk='$mainKey'
+        nvram set wl1_wds_wpa_psk='$mainKey'
+        nvram commit 2>/dev/null || true
+      fi
+
+      # 11. Script permanente de anexión automática WDS/mesh al bridge br-lan
       mkdir -p /etc/hotplug.d/net
       cat << 'EOF' > /etc/hotplug.d/net/99-wds-bridge
-      if echo "\$INTERFACE" | grep -qE "wds"; then
+      if echo "\$INTERFACE" | grep -qE "wds|wl"; then
         brctl addif br-lan "\$INTERFACE" 2>/dev/null || true
       fi
 EOF
+      chmod +x /etc/hotplug.d/net/99-wds-bridge 2>/dev/null || true
 
-      (brctl addif br-lan wds1.1 2>/dev/null || true)
-      (brctl addif br-lan wds0.1 2>/dev/null || true)
+      # 12. Servicio Mesh Watchdog en arranque (Enlace continuo resiliente)
+      cat << 'EOF' > /etc/init.d/mesh_watchdog
+#!/bin/sh /etc/rc.common
+START=99
+start() {
+  (
+    while true; do
+      sleep 20
+      if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
+        wl -i wl1 wet 1 2>/dev/null || true
+        wl -i wl1 join '$mainSsid' 2>/dev/null || true
+        for dev in \$(ifconfig -a | grep -E "wds|wl1" | awk '{print \$1}'); do
+          brctl addif br-lan "\$dev" 2>/dev/null || true
+        done
+      fi
+    done
+  ) &
+}
+EOF
+      chmod +x /etc/init.d/mesh_watchdog 2>/dev/null || true
+      /etc/init.d/mesh_watchdog enable 2>/dev/null || true
 
-      # 11. Reinicio de red
-      (/etc/init.d/network restart) &
-      (sleep 2 && wifi down && sleep 1 && wifi up) &
+      # 13. Reinicio limpio del satélite para arrancar sin bloqueos en su nueva IP
+      (sleep 2 && reboot) &
     ''';
 
     try {
