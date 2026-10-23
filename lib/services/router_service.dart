@@ -1315,9 +1315,9 @@ start() {
     while true; do
       sleep 12
       if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
-        wl -i wl1 wet 1 2>/dev/null || true
-        ${mainKey.isNotEmpty ? "wl -i wl1 join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i wl1 join '$mainSsid' 2>/dev/null || true"}
-        for dev in \$(ifconfig -a | grep -E "wds|wl1" | awk '{print \$1}'); do
+        wl -i $staWl wet 1 2>/dev/null || true
+        ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
+        for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
           brctl addif br-lan "\$dev" 2>/dev/null || true
         done
       fi
@@ -1353,6 +1353,7 @@ EOF
     int channel5 = 36,
     int channel24 = 6,
     String mainBssid = '',
+    String backhaulBand = '2.4 GHz',
     void Function(String step, double progress)? onProgress,
   }) async {
     onProgress?.call('Conectando a LuCI en $satIp y arrancando Dropbear SSH...', 0.20);
@@ -1374,7 +1375,11 @@ EOF
     final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
     final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
 
-    onProgress?.call('Inyectando configuración Mesh WDS, canales y nueva IP $targetIp...', 0.65);
+    final is24 = !backhaulBand.contains('5');
+    final staRadio = is24 ? 'radio0' : 'radio1';
+    final staWl = is24 ? 'wl0' : 'wl1';
+
+    onProgress?.call('Inyectando configuración Mesh (Backhaul $backhaulBand), canales e IP $targetIp...', 0.65);
 
     // PASO 2: Configuración Mesh WDS completa
     final script = '''
@@ -1461,10 +1466,10 @@ EOF
         uci -q delete wireless.\${iface}.wds
       done
 
-      # 10. Configurar enlace cliente inalámbrico (Backhaul STA) en 5 GHz hacia el Router Principal
+      # 10. Configurar enlace cliente inalámbrico (Backhaul STA en $staRadio) hacia el Router Principal
       uci -q delete wireless.mesh_sta
       uci set wireless.mesh_sta=wifi-iface
-      uci set wireless.mesh_sta.device='radio1'
+      uci set wireless.mesh_sta.device='$staRadio'
       uci set wireless.mesh_sta.mode='sta'
       uci set wireless.mesh_sta.network='lan'
       ${mainSsid.isNotEmpty ? "uci set wireless.mesh_sta.ssid='$mainSsid'" : ""}
@@ -1619,6 +1624,59 @@ EOF
     ''';
     try {
       await executeSSH(currentSatIp, satPassword, script);
+    } catch (_) {}
+  }
+
+  /// Cambia la banda de enlace (Backhaul 2.4 GHz vs 5 GHz) en un satélite activo
+  static Future<void> switchSatelliteBackhaulBand({
+    required String satIp,
+    required String satPassword,
+    required String mainGateway,
+    required String mainSsid,
+    required String mainKey,
+    required String targetBand, // '2.4 GHz' o '5 GHz'
+  }) async {
+    final is24 = !targetBand.contains('5');
+    final staRadio = is24 ? 'radio0' : 'radio1';
+    final staWl = is24 ? 'wl0' : 'wl1';
+
+    final script = '''
+      uci -q delete wireless.mesh_sta
+      uci set wireless.mesh_sta=wifi-iface
+      uci set wireless.mesh_sta.device='$staRadio'
+      uci set wireless.mesh_sta.mode='sta'
+      uci set wireless.mesh_sta.network='lan'
+      ${mainSsid.isNotEmpty ? "uci set wireless.mesh_sta.ssid='$mainSsid'" : ""}
+      ${mainKey.isNotEmpty ? "uci set wireless.mesh_sta.key='$mainKey'" : ""}
+      uci set wireless.mesh_sta.encryption='psk2'
+      uci commit wireless
+
+      cat << 'EOF' > /etc/init.d/mesh_watchdog
+#!/bin/sh /etc/rc.common
+START=99
+start() {
+  (
+    while true; do
+      sleep 12
+      if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
+        wl -i $staWl wet 1 2>/dev/null || true
+        ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
+        for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
+          brctl addif br-lan "\$dev" 2>/dev/null || true
+        done
+      fi
+    done
+  ) &
+}
+EOF
+      chmod +x /etc/init.d/mesh_watchdog 2>/dev/null || true
+      /etc/init.d/mesh_watchdog enable 2>/dev/null || true
+      sync
+      (sleep 2 && reboot) &
+    ''';
+
+    try {
+      await executeSSH(satIp, satPassword, script);
     } catch (_) {}
   }
 }
