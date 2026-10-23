@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import 'services/router_service.dart';
 
 void main() {
@@ -644,6 +646,194 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     } finally {
       setState(() => _isProvisioningSat = false);
     }
+  }
+
+  // Escáner QR para etiquetas de router
+  Map<String, String> _parseRouterQr(String raw) {
+    final result = <String, String>{};
+    final trimmed = raw.trim();
+
+    // 1. Estándar Wi-Fi Alliance: WIFI:S:ssid;T:WPA;P:password;;
+    if (trimmed.toUpperCase().startsWith('WIFI:')) {
+      final body = trimmed.substring(5);
+      final tokens = body.split(';');
+      for (final tok in tokens) {
+        if (tok.toUpperCase().startsWith('S:')) {
+          result['ssid'] = tok.substring(2).trim();
+        } else if (tok.toUpperCase().startsWith('P:')) {
+          result['password'] = tok.substring(2).trim();
+        } else if (tok.toUpperCase().startsWith('T:')) {
+          result['encryption'] = tok.substring(2).trim();
+        }
+      }
+      return result;
+    }
+
+    // 2. Formato JSON
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        final map = jsonDecode(trimmed) as Map<String, dynamic>;
+        if (map.containsKey('password')) result['password'] = map['password'].toString();
+        if (map.containsKey('key')) result['password'] = map['key'].toString();
+        if (map.containsKey('ssid')) result['ssid'] = map['ssid'].toString();
+        return result;
+      } catch (_) {}
+    }
+
+    // 3. Delimitadores clave=valor
+    if (trimmed.contains(';') || trimmed.contains('&') || trimmed.contains(',')) {
+      final pMatch = RegExp(r'(?:pass|pwd|password|key|wpa_psk)=([^;,&]+)', caseSensitive: false).firstMatch(trimmed);
+      if (pMatch != null) result['password'] = pMatch.group(1)!.trim();
+
+      final sMatch = RegExp(r'(?:ssid|net|name)=([^;,&]+)', caseSensitive: false).firstMatch(trimmed);
+      if (sMatch != null) result['ssid'] = sMatch.group(1)!.trim();
+
+      if (result.isNotEmpty) return result;
+    }
+
+    // 4. Clave directa
+    result['password'] = trimmed;
+    return result;
+  }
+
+  void _openQrScanner() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => _buildQrScannerModal(ctx),
+    );
+  }
+
+  Widget _buildQrScannerModal(BuildContext sheetCtx) {
+    final MobileScannerController controller = MobileScannerController(
+      detectionSpeed: DetectionSpeed.normal,
+      facing: CameraFacing.back,
+      torchEnabled: false,
+    );
+    bool hasDetected = false;
+
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.75,
+      decoration: const BoxDecoration(
+        color: Color(0xFF0F172A),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      child: Column(
+        children: [
+          Container(
+            margin: const EdgeInsets.only(top: 12),
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(2)),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.qr_code_scanner, color: Color(0xFF60A5FA), size: 24),
+                    SizedBox(width: 8),
+                    Text(
+                      'Escanear QR de la Etiqueta',
+                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white),
+                    ),
+                  ],
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white70),
+                  onPressed: () {
+                    controller.dispose();
+                    Navigator.of(sheetCtx).pop();
+                  },
+                ),
+              ],
+            ),
+          ),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 20),
+            child: Text(
+              'Apunta la cámara al código QR impreso debajo del equipo Motorola para cargar la clave de forma automática.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+              textAlign: TextAlign.center,
+            ),
+          ),
+          const SizedBox(height: 16),
+          Expanded(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  MobileScanner(
+                    controller: controller,
+                    onDetect: (capture) {
+                      if (hasDetected) return;
+                      final List<Barcode> barcodes = capture.barcodes;
+                      for (final barcode in barcodes) {
+                        final raw = barcode.rawValue;
+                        if (raw != null && raw.trim().isNotEmpty) {
+                          hasDetected = true;
+                          final parsed = _parseRouterQr(raw);
+                          final pass = parsed['password'] ?? '';
+                          final ssid = parsed['ssid'] ?? '';
+
+                          setState(() {
+                            if (pass.isNotEmpty) {
+                              _addSatPassController.text = pass;
+                            }
+                            if (ssid.isNotEmpty && _addSatNameController.text == 'Equipo Sala') {
+                              _addSatNameController.text = 'Satélite $ssid';
+                            }
+                          });
+
+                          controller.dispose();
+                          Navigator.of(sheetCtx).pop();
+                          _showSnack(
+                            pass.isNotEmpty
+                                ? '✔ QR detectado con éxito: Contraseña cargada'
+                                : '✔ Código QR escaneado',
+                          );
+                          break;
+                        }
+                      }
+                    },
+                  ),
+                  Container(
+                    width: 220,
+                    height: 220,
+                    decoration: BoxDecoration(
+                      border: Border.all(color: const Color(0xFF3B82F6), width: 3),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                IconButton.filledTonal(
+                  onPressed: () => controller.toggleTorch(),
+                  icon: const Icon(Icons.flash_on, color: Colors.white),
+                  tooltip: 'Linterna',
+                ),
+                IconButton.filledTonal(
+                  onPressed: () => controller.switchCamera(),
+                  icon: const Icon(Icons.flip_camera_ios, color: Colors.white),
+                  tooltip: 'Cambiar Cámara',
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   // TAB 3: Comprobar Calidad de un Nodo Satélite
@@ -1531,7 +1721,25 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   ),
                 ),
 
-                const SizedBox(height: 12),
+                const SizedBox(height: 14),
+
+                // Botón Escanear QR de la Etiqueta
+                OutlinedButton.icon(
+                  onPressed: _openQrScanner,
+                  icon: const Icon(Icons.qr_code_scanner, color: Color(0xFF60A5FA), size: 22),
+                  label: const Text(
+                    'Escanear QR de la Etiqueta del Satélite',
+                    style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF60A5FA), fontSize: 13),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+                    side: const BorderSide(color: Color(0xFF3B82F6), width: 1.5),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    backgroundColor: const Color(0xFF1E3A8A).withOpacity(0.2),
+                  ),
+                ),
+
+                const SizedBox(height: 14),
 
                 // Clave de la etiqueta del Satélite
                 TextField(
@@ -1540,12 +1748,22 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
                     labelText: 'Contraseña de la etiqueta del Satélite',
-                    helperText: 'Clave impresa abajo del equipo nuevo',
+                    helperText: 'Clave impresa abajo o escaneada por QR',
                     border: const OutlineInputBorder(),
                     prefixIcon: const Icon(Icons.key, color: Color(0xFF3B82F6)),
-                    suffixIcon: IconButton(
-                      icon: Icon(_addSatPassObscure ? Icons.visibility : Icons.visibility_off, color: Colors.grey),
-                      onPressed: () => setState(() => _addSatPassObscure = !_addSatPassObscure),
+                    suffixIcon: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.qr_code_scanner, color: Color(0xFF60A5FA)),
+                          tooltip: 'Escanear QR',
+                          onPressed: _openQrScanner,
+                        ),
+                        IconButton(
+                          icon: Icon(_addSatPassObscure ? Icons.visibility : Icons.visibility_off, color: Colors.grey),
+                          onPressed: () => setState(() => _addSatPassObscure = !_addSatPassObscure),
+                        ),
+                      ],
                     ),
                   ),
                 ),
