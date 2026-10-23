@@ -117,6 +117,22 @@ class WirelessScanResult {
   });
 }
 
+class CableSatelliteCandidate {
+  final String ip;
+  final String mac;
+  final String hostname;
+  final String interface;
+  final bool isMotorola;
+
+  CableSatelliteCandidate({
+    required this.ip,
+    required this.mac,
+    required this.hostname,
+    required this.interface,
+    required this.isMotorola,
+  });
+}
+
 class RouterService {
   /// Desbloquea y arranca LuCI y SSH directamente desde la app mediante POST con contraseña,
   /// preservando las cookies de sesión (sysauth / sysauth_https) y verificando el puerto 22
@@ -973,6 +989,260 @@ class RouterService {
 
     results.sort((a, b) => b.signal.compareTo(a.signal));
     return results;
+  }
+
+  /// Detecta satélites conectados por cable al Router Principal (inspeccionando Leases DHCP y ARP)
+  static Future<List<CableSatelliteCandidate>> findCableSatellites(String mainIp, String mainPassword) async {
+    const script = '''
+      echo "===LEASES===" && cat /tmp/dhcp.leases 2>/dev/null || cat /var/dhcp.leases 2>/dev/null
+      echo "===ARP===" && cat /proc/net/arp 2>/dev/null
+    ''';
+
+    final output = await executeSSH(mainIp, mainPassword, script);
+    final results = <CableSatelliteCandidate>[];
+    final parts = output.split('===');
+    String leasesRaw = '';
+    String arpRaw = '';
+
+    for (int i = 1; i < parts.length; i += 2) {
+      final tag = parts[i].trim();
+      final body = i + 1 < parts.length ? parts[i + 1] : '';
+      if (tag == 'LEASES') leasesRaw = body;
+      if (tag == 'ARP') arpRaw = body;
+    }
+
+    final leaseMap = <String, String>{};
+    for (final line in leasesRaw.split('\n')) {
+      final tokens = line.trim().split(RegExp(r'\s+'));
+      if (tokens.length >= 4) {
+        final mac = tokens[1].toUpperCase();
+        final ip = tokens[2];
+        final host = tokens[3] == '*' ? 'Dispositivo' : tokens[3];
+        leaseMap[mac] = host;
+
+        final isMoto = mac.startsWith('C8:C7:50') ||
+                       mac.startsWith('00:0C:E7') ||
+                       mac.startsWith('14:59:C0') ||
+                       host.toLowerCase().contains('moto') ||
+                       host.toLowerCase().contains('openwrt');
+
+        if (!results.any((r) => r.mac == mac) && ip != mainIp) {
+          results.add(CableSatelliteCandidate(
+            ip: ip,
+            mac: mac,
+            hostname: host,
+            interface: 'eth',
+            isMotorola: isMoto,
+          ));
+        }
+      }
+    }
+
+    for (final line in arpRaw.split('\n')) {
+      final tokens = line.trim().split(RegExp(r'\s+'));
+      if (tokens.length >= 6) {
+        final ip = tokens[0];
+        final mac = tokens[3].toUpperCase();
+        final iface = tokens[5];
+
+        if (mac.length == 17 && mac != '00:00:00:00:00:00' && ip != mainIp) {
+          final isMoto = mac.startsWith('C8:C7:50') ||
+                         mac.startsWith('00:0C:E7') ||
+                         mac.startsWith('14:59:C0');
+          if (!results.any((r) => r.mac == mac)) {
+            final host = leaseMap[mac] ?? (isMoto ? 'Satélite Motorola' : 'Equipo LAN');
+            results.add(CableSatelliteCandidate(
+              ip: ip,
+              mac: mac,
+              hostname: host,
+              interface: iface,
+              isMotorola: isMoto,
+            ));
+          }
+        }
+      }
+    }
+
+    results.sort((a, b) => (b.isMotorola ? 1 : 0).compareTo(a.isMotorola ? 1 : 0));
+    return results;
+  }
+
+  /// Calcula dinámicamente la siguiente IP disponible en el pool (192.168.1.2, .3, .4, .5)
+  static Future<String> getNextAvailableSatelliteIp(String mainIp, String mainPassword, List<String> existingIps) async {
+    const candidateIps = ['192.168.1.2', '192.168.1.3', '192.168.1.4', '192.168.1.5'];
+    final script = candidateIps.map((ip) => 'ping -c 1 -W 1 $ip >/dev/null 2>&1 && echo "$ip:ALIVE" || echo "$ip:FREE"').join('; ');
+
+    try {
+      final output = await executeSSH(mainIp, mainPassword, script);
+      for (final candidate in candidateIps) {
+        if (existingIps.contains(candidate)) continue;
+        if (output.contains('$candidate:FREE')) {
+          return candidate;
+        }
+      }
+    } catch (_) {}
+
+    for (final candidate in candidateIps) {
+      if (!existingIps.contains(candidate)) return candidate;
+    }
+    return '192.168.1.2';
+  }
+
+  /// Sincroniza y aprovisiona un satélite conectado por cable (Plug & Mesh)
+  static Future<void> provisionSatelliteOverCable({
+    required String tempSatIp,
+    required String satPassword,
+    required String targetIp,
+    required String mainGateway,
+    required String mainSsid,
+    required String mainKey,
+    String satName = 'Equipo Satélite',
+    int channel5 = 36,
+    int channel24 = 6,
+  }) async {
+    final unlocked = await unlockRouter(tempSatIp, satPassword);
+    if (!unlocked) {
+      throw Exception('No se pudo desbloquear el satélite en $tempSatIp. Verifica que la contraseña de etiqueta sea correcta.');
+    }
+    await Future.delayed(const Duration(seconds: 2));
+
+    final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
+    final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
+
+    final script = '''
+      # 1. Neutralizar completamente unum/minim
+      /etc/init.d/unum stop 2>/dev/null || true
+      /etc/init.d/unum disable 2>/dev/null || true
+      /etc/init.d/minim stop 2>/dev/null || true
+      /etc/init.d/minim disable 2>/dev/null || true
+      killall -9 unum 2>/dev/null || true
+      killall -9 minim 2>/dev/null || true
+      echo '#!/bin/sh' > /usr/bin/unum 2>/dev/null || true
+      echo 'exit 0' >> /usr/bin/unum 2>/dev/null || true
+      chmod 755 /usr/bin/unum 2>/dev/null || true
+      rm -f /tmp/provision_info.json 2>/dev/null || true
+
+      # 2. Hostname del Satélite
+      uci set system.@system[0].hostname='$cleanHost'
+      echo '$cleanHost' > /proc/sys/kernel/hostname
+      uci commit system
+
+      # 3. Canales Wi-Fi
+      uci -q set wireless.radio0.channel='$channel24'
+      uci -q set wireless.radio1.channel='$channel5'
+      uci -q delete wireless.radio0.wds
+      uci -q delete wireless.radio1.wds
+
+      # 4. NVRAM
+      if which nvram >/dev/null 2>&1; then
+        nvram set router_name='$cleanHost'
+        ${mainSsid.isNotEmpty ? "nvram set wl0_ssid='$mainSsid'" : ""}
+        ${mainSsid.isNotEmpty ? "nvram set wl1_ssid='$mainSsid'" : ""}
+        ${mainSsid.isNotEmpty ? "nvram set wl_ssid='$mainSsid'" : ""}
+        ${mainKey.isNotEmpty ? "nvram set wl0_wpa_psk='$mainKey'" : ""}
+        ${mainKey.isNotEmpty ? "nvram set wl1_wpa_psk='$mainKey'" : ""}
+        ${mainKey.isNotEmpty ? "nvram set wl_wpa_psk='$mainKey'" : ""}
+        nvram set wl0_akm='psk2'
+        nvram set wl1_akm='psk2'
+        nvram set wl0_channel='$channel24'
+        nvram set wl1_channel='$channel5'
+        nvram set wl0_lazywds='1'
+        nvram set wl1_lazywds='1'
+        nvram unset wl0_wds 2>/dev/null || true
+        nvram unset wl1_wds 2>/dev/null || true
+        nvram commit 2>/dev/null || true
+      fi
+
+      # 5. Inyección a radios Broadcom
+      wl -i wl0 channel $channel24 2>/dev/null || true
+      wl -i wl1 channel $channel5 2>/dev/null || true
+      ${mainSsid.isNotEmpty ? "wl -i wl0 ssid '$mainSsid' 2>/dev/null || true" : ""}
+      ${mainSsid.isNotEmpty ? "wl -i wl1 ssid '$mainSsid' 2>/dev/null || true" : ""}
+      ${mainKey.isNotEmpty ? "wl -i wl0 wpa_psk '$mainKey' 2>/dev/null || true" : ""}
+      ${mainKey.isNotEmpty ? "wl -i wl1 wpa_psk '$mainKey' 2>/dev/null || true" : ""}
+      wl -i wl0 lazywds 1 2>/dev/null || true
+      wl -i wl1 lazywds 1 2>/dev/null || true
+
+      # 6. Modo Switch Universal: unificar WAN y LAN en br-lan
+      uci -q delete network.wan
+      uci -q delete network.wan6
+      uci -q set network.lan.ifname='eth0 eth1'
+      uci -q set network.lan.type='bridge'
+
+      # 7. Configurar IP fija final y gateway
+      uci set network.lan.ipaddr='$targetIp'
+      uci set network.lan.netmask='255.255.255.0'
+      uci set network.lan.gateway='$mainGateway'
+      uci -q delete network.lan.dns
+      uci add_list network.lan.dns='$mainGateway'
+      uci commit network
+
+      # 8. Apagar DHCP
+      uci set dhcp.lan.ignore='1'
+      uci commit dhcp
+      /etc/init.d/dnsmasq stop 2>/dev/null || true
+      /etc/init.d/dnsmasq disable 2>/dev/null || true
+
+      # 9. Clonar AP Wi-Fi en UCI
+      for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
+        ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
+        ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
+        uci set wireless.\${iface}.encryption='psk2'
+        uci set wireless.\${iface}.disabled='0'
+        uci -q delete wireless.\${iface}.wds
+      done
+
+      # 10. Enlace inalámbrico (Backhaul STA en 5 GHz) para cuando se desconecte el cable
+      uci -q delete wireless.mesh_sta
+      uci set wireless.mesh_sta=wifi-iface
+      uci set wireless.mesh_sta.device='radio1'
+      uci set wireless.mesh_sta.mode='sta'
+      uci set wireless.mesh_sta.network='lan'
+      ${mainSsid.isNotEmpty ? "uci set wireless.mesh_sta.ssid='$mainSsid'" : ""}
+      ${mainKey.isNotEmpty ? "uci set wireless.mesh_sta.key='$mainKey'" : ""}
+      uci set wireless.mesh_sta.encryption='psk2'
+      uci commit wireless
+
+      # 11. Script de anexión a bridge
+      mkdir -p /etc/hotplug.d/net
+      cat << 'EOF' > /etc/hotplug.d/net/99-wds-bridge
+      if echo "\$INTERFACE" | grep -qE "wds|wl"; then
+        brctl addif br-lan "\$INTERFACE" 2>/dev/null || true
+      fi
+EOF
+      chmod +x /etc/hotplug.d/net/99-wds-bridge 2>/dev/null || true
+
+      # 12. Watchdog
+      cat << 'EOF' > /etc/init.d/mesh_watchdog
+#!/bin/sh /etc/rc.common
+START=99
+start() {
+  (
+    while true; do
+      sleep 12
+      if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
+        wl -i wl1 wet 1 2>/dev/null || true
+        ${mainKey.isNotEmpty ? "wl -i wl1 join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i wl1 join '$mainSsid' 2>/dev/null || true"}
+        for dev in \$(ifconfig -a | grep -E "wds|wl1" | awk '{print \$1}'); do
+          brctl addif br-lan "\$dev" 2>/dev/null || true
+        done
+      fi
+    done
+  ) &
+}
+EOF
+      chmod +x /etc/init.d/mesh_watchdog 2>/dev/null || true
+      /etc/init.d/mesh_watchdog enable 2>/dev/null || true
+
+      # 13. Flush y reinicio
+      sync
+      sync
+      (sleep 2 && reboot) &
+    ''';
+
+    try {
+      await executeSSH(tempSatIp, satPassword, script);
+    } catch (_) {}
   }
 
   /// Aprovisionamiento Guiado Inalámbrico del Satélite desde el teléfono
