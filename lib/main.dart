@@ -300,6 +300,96 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     );
   }
 
+  // Cuenta regresiva animada para reinicio limpio del router
+  Future<void> _showRebootCountdownDialog(String reason) async {
+    int secondsLeft = 40;
+    Timer? timer;
+    await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            timer ??= Timer.periodic(const Duration(seconds: 1), (t) {
+              if (secondsLeft > 0) {
+                setDialogState(() => secondsLeft--);
+              } else {
+                t.cancel();
+                Navigator.of(ctx).pop();
+              }
+            });
+
+            final progress = (40 - secondsLeft) / 40.0;
+
+            return AlertDialog(
+              backgroundColor: const Color(0xFF1E293B),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              title: const Row(
+                children: [
+                  Icon(Icons.restart_alt, color: Color(0xFF38BDF8), size: 26),
+                  SizedBox(width: 10),
+                  Text(
+                    'Reiniciando Router',
+                    style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  const SizedBox(height: 10),
+                  Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      SizedBox(
+                        width: 90,
+                        height: 90,
+                        child: CircularProgressIndicator(
+                          value: progress,
+                          strokeWidth: 6,
+                          backgroundColor: Colors.white12,
+                          color: const Color(0xFF2563EB),
+                        ),
+                      ),
+                      Text(
+                        '${secondsLeft}s',
+                        style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+                  Text(
+                    reason,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'El router guardó los cambios en NVRAM y se está reiniciando de forma segura para activar el chip Broadcom sin colgarse. La app se reconectará sola.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.grey, fontSize: 11),
+                  ),
+                ],
+              ),
+              actions: [
+                if (secondsLeft == 0)
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2563EB)),
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    child: const Text('Reconectar Ahora'),
+                  ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    timer?.cancel();
+    _showSnack('Reconectando al router principal...');
+    await _login();
+  }
+
   // Guardar Wi-Fi
   Future<void> _saveWifi() async {
     setState(() => _isLoading = true);
@@ -317,10 +407,13 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       );
 
       await RouterService.saveWifiConfig(_currentIp, _currentPassword, cfg);
-      _showSnack('Wi-Fi, Cifrado y Potencia aplicados. Reiniciando radios...');
+      setState(() => _isLoading = false);
+
+      if (mounted) {
+        await _showRebootCountdownDialog('Configuración Wi-Fi guardada en NVRAM');
+      }
     } catch (e) {
       _showSnack('Error al guardar Wi-Fi: $e', isError: true);
-    } finally {
       setState(() => _isLoading = false);
     }
   }
@@ -502,11 +595,13 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               'El equipo ha sido configurado como Satélite Mesh:\n\n'
               '• Nombre: $satName\n'
               '• Nueva IP: $targetIp\n'
-              '• Red Wi-Fi clonada: $mainSsid\n'
-              '• Servidor DHCP: Apagado\n'
-              '• Minim Cloud: Desactivado\n\n'
+              '• Red Wi-Fi sincronizada: $mainSsid\n'
+              '• Modo enlace: Broadcom WDS + Watchdog activo\n'
+              '• Servidor DHCP: Apagado (Cero conflictos)\n\n'
+              '🔄 REINICIANDO SATÉLITE:\n'
+              'El satélite se está reiniciando de forma limpia para arrancar en su nueva IP sin congelarse.\n\n'
               '👉 PASO FINAL:\n'
-              'Reconecta tu celular al Wi-Fi de tu router principal ($mainSsid) y ve a la pestaña "Control Satélites".',
+              'Vuelve a conectar tu celular a tu red "$mainSsid" y ve a la pestaña "Control Satélites".',
               style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.4),
             ),
             actions: [
@@ -1035,8 +1130,8 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 const SizedBox(height: 20),
                 ElevatedButton.icon(
                   onPressed: _isLoading ? null : _saveWifi,
-                  icon: const Icon(Icons.save),
-                  label: const Text('Guardar Cambios Wi-Fi en Router Principal', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                  icon: const Icon(Icons.restart_alt),
+                  label: const Text('Guardar Cambios y Reiniciar Router Limpiamente', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF2563EB),
                     foregroundColor: Colors.white,
