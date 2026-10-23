@@ -1315,8 +1315,8 @@ start() {
     while true; do
       sleep 12
       if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
-        wl -i $staWl wet 1 2>/dev/null || true
-        ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
+        wl -i wl1 wet 1 2>/dev/null || true
+        ${mainKey.isNotEmpty ? "wl -i wl1 join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i wl1 join '$mainSsid' 2>/dev/null || true"}
         for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
           brctl addif br-lan "\$dev" 2>/dev/null || true
         done
@@ -1502,9 +1502,9 @@ start() {
     while true; do
       sleep 12
       if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
-        wl -i wl1 wet 1 2>/dev/null || true
-        ${mainKey.isNotEmpty ? "wl -i wl1 join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i wl1 join '$mainSsid' 2>/dev/null || true"}
-        for dev in \$(ifconfig -a | grep -E "wds|wl1" | awk '{print \$1}'); do
+        wl -i $staWl wet 1 2>/dev/null || true
+        ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
+        for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
           brctl addif br-lan "\$dev" 2>/dev/null || true
         done
       fi
