@@ -95,6 +95,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   String _selectedDns = '1.1.1.1,1.0.0.1';
 
   // Tab 2: Agregar Satélites State
+  final TextEditingController _addSatMainSsidController = TextEditingController(text: 'Motorolamesh');
+  final TextEditingController _addSatMainKeyController = TextEditingController();
+  bool _addSatMainKeyObscure = true;
   final TextEditingController _addSatNameController = TextEditingController(text: 'Equipo Sala');
   final TextEditingController _addSatPassController = TextEditingController();
   String _addSatPresetIp = '192.168.1.2';
@@ -166,8 +169,18 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       final wifi = await RouterService.getWifiConfig(_currentIp, _currentPassword);
       setState(() {
         _separateBands = wifi.separateBands;
-        if (wifi.ssid24.isNotEmpty) _ssid24Controller.text = wifi.ssid24;
-        if (wifi.key24.isNotEmpty) _key24Controller.text = wifi.key24;
+        if (wifi.ssid24.isNotEmpty) {
+          _ssid24Controller.text = wifi.ssid24;
+          if (_addSatMainSsidController.text.isEmpty || _addSatMainSsidController.text == 'Motorolamesh') {
+            _addSatMainSsidController.text = wifi.ssid24;
+          }
+        }
+        if (wifi.key24.isNotEmpty) {
+          _key24Controller.text = wifi.key24;
+          if (_addSatMainKeyController.text.isEmpty) {
+            _addSatMainKeyController.text = wifi.key24;
+          }
+        }
         _enc24 = wifi.enc24.isNotEmpty ? wifi.enc24 : 'psk2';
 
         if (wifi.ssid5.isNotEmpty) _ssid5Controller.text = wifi.ssid5;
@@ -525,8 +538,8 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   void _selectNetworkForMesh(WirelessScanResult net) {
     setState(() {
       _selectedNetwork = net;
-      if (net.ssid != 'Red Oculta') {
-        _ssid24Controller.text = net.ssid;
+      if (!net.ssid.startsWith('Red Oculta')) {
+        _addSatMainSsidController.text = net.ssid;
       }
       if (net.channel > 14) {
         _mainChannel5 = net.channel;
@@ -545,12 +558,17 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     final satPass = _addSatPassController.text.trim();
     final targetIp = _addSatPresetIp;
     final mainGw = _currentIp.isNotEmpty ? _currentIp : '192.168.1.1';
-    final mainSsid = _ssid24Controller.text.trim().isNotEmpty ? _ssid24Controller.text.trim() : 'LanRouterWiFi';
-    final mainKey = _key24Controller.text.trim();
+    final mainSsid = _addSatMainSsidController.text.trim().isNotEmpty
+        ? _addSatMainSsidController.text.trim()
+        : (_ssid24Controller.text.trim().isNotEmpty ? _ssid24Controller.text.trim() : 'Motorolamesh');
+    final mainKey = _addSatMainKeyController.text.trim().isNotEmpty
+        ? _addSatMainKeyController.text.trim()
+        : _key24Controller.text.trim();
 
+    if (mainSsid.isEmpty) return _showSnack('Indica el nombre de la red Wi-Fi principal a repetir', isError: true);
+    if (mainKey.isEmpty) return _showSnack('Indica la contraseña de tu red Wi-Fi principal', isError: true);
     if (satName.isEmpty) return _showSnack('Indica un nombre para el satélite (ej: Equipo Sala)', isError: true);
     if (satPass.isEmpty) return _showSnack('Ingresa la contraseña de la etiqueta del satélite', isError: true);
-    if (mainSsid.isEmpty) return _showSnack('Configura primero el SSID de tu red Wi-Fi en la pestaña 1', isError: true);
 
     setState(() => _isProvisioningSat = true);
     try {
@@ -1466,6 +1484,41 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 const Text('Configurar Nuevo Satélite', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
                 const SizedBox(height: 14),
 
+                // Red Wi-Fi Principal a Repetir
+                TextField(
+                  controller: _addSatMainSsidController,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: const InputDecoration(
+                    labelText: 'Nombre de tu Red Wi-Fi Principal (SSID)',
+                    hintText: 'Ej: Motorolamesh',
+                    helperText: 'El satélite repetirá este nombre exactamente',
+                    border: OutlineInputBorder(),
+                    prefixIcon: Icon(Icons.wifi, color: Color(0xFF3B82F6)),
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+
+                const SizedBox(height: 12),
+
+                // Contraseña de la Red Wi-Fi Principal
+                TextField(
+                  controller: _addSatMainKeyController,
+                  obscureText: _addSatMainKeyObscure,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    labelText: 'Contraseña de tu Red Wi-Fi Principal',
+                    helperText: 'Clave WPA2 necesaria para enlazar el satélite',
+                    border: const OutlineInputBorder(),
+                    prefixIcon: const Icon(Icons.lock, color: Color(0xFF3B82F6)),
+                    suffixIcon: IconButton(
+                      icon: Icon(_addSatMainKeyObscure ? Icons.visibility : Icons.visibility_off, color: Colors.grey),
+                      onPressed: () => setState(() => _addSatMainKeyObscure = !_addSatMainKeyObscure),
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 14),
+
                 // Nombre para el Satélite
                 TextField(
                   controller: _addSatNameController,
@@ -1487,6 +1540,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
                     labelText: 'Contraseña de la etiqueta del Satélite',
+                    helperText: 'Clave impresa abajo del equipo nuevo',
                     border: const OutlineInputBorder(),
                     prefixIcon: const Icon(Icons.key, color: Color(0xFF3B82F6)),
                     suffixIcon: IconButton(
@@ -1551,7 +1605,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                           const Icon(Icons.wifi, color: Color(0xFF34D399), size: 18),
                           const SizedBox(width: 6),
                           Text(
-                            _ssid24Controller.text.isNotEmpty ? _ssid24Controller.text : 'LanRouterWiFi',
+                            _addSatMainSsidController.text.isNotEmpty
+                                ? _addSatMainSsidController.text
+                                : (_ssid24Controller.text.isNotEmpty ? _ssid24Controller.text : 'Motorolamesh'),
                             style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white),
                           ),
                         ],
