@@ -39,6 +39,7 @@ class MotoRouterApp extends StatelessWidget {
 class MeshNode {
   String name;
   String ip;
+  String mac;
   String password;
   int txPower;
   SatelliteQuality? quality;
@@ -47,6 +48,7 @@ class MeshNode {
   MeshNode({
     required this.name,
     required this.ip,
+    this.mac = '',
     this.password = '',
     this.txPower = 23,
     this.quality,
@@ -56,6 +58,7 @@ class MeshNode {
   Map<String, dynamic> toJson() => {
     'name': name,
     'ip': ip,
+    'mac': mac,
     'password': password,
     'txPower': txPower,
   };
@@ -63,6 +66,7 @@ class MeshNode {
   factory MeshNode.fromJson(Map<String, dynamic> json) => MeshNode(
     name: json['name'] ?? 'Satélite',
     ip: json['ip'] ?? '192.168.1.2',
+    mac: json['mac'] ?? '',
     password: json['password'] ?? '',
     txPower: json['txPower'] ?? 23,
   );
@@ -142,6 +146,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   // Tab 3: Control de Satélites Mesh State
   final List<MeshNode> _meshNodes = [];
   bool _isCheckingAllNodes = false;
+  bool _isDiscoveringSatellites = false;
 
   // DHCP Leases State
   List<DhcpLeaseEntry> _dhcpLeases = [];
@@ -739,7 +744,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     );
 
     try {
-      await RouterService.provisionSatelliteDirect(
+      final satMac = await RouterService.provisionSatelliteDirect(
         satIp: '192.168.1.1',
         satPassword: satPass,
         targetIp: targetIp,
@@ -762,9 +767,10 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       final existingIdx = _meshNodes.indexWhere((n) => n.ip == targetIp);
       if (existingIdx != -1) {
         _meshNodes[existingIdx].name = satName;
+        _meshNodes[existingIdx].mac = satMac;
         _meshNodes[existingIdx].password = satPass;
       } else {
-        _meshNodes.add(MeshNode(name: satName, ip: targetIp, password: satPass));
+        _meshNodes.add(MeshNode(name: satName, ip: targetIp, mac: satMac, password: satPass));
       }
       await _persistMeshNodes();
       await _calculateNextIp();
@@ -1271,6 +1277,154 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         ],
       ),
     );
+  }
+
+  // TAB 3: Auto-detección dinámica de Satélites en la Red (DHCP/ARP)
+  Future<void> _autoDiscoverSatellites() async {
+    setState(() => _isDiscoveringSatellites = true);
+    _showSnack('Escaneando la red en busca de satélites activos...');
+    try {
+      final leases = await RouterService.getDhcpLeases(_currentIp, _currentPassword);
+      int updatedCount = 0;
+
+      for (var lease in leases) {
+        final hostLower = lease.hostname.toLowerCase();
+        final ip = lease.ip;
+
+        if (ip == _currentIp) continue;
+
+        MeshNode? matchedNode;
+        for (var node in _meshNodes) {
+          if (node.mac.isNotEmpty && node.mac.toLowerCase() == lease.mac.toLowerCase()) {
+            matchedNode = node;
+            break;
+          }
+          if (node.name.toLowerCase().replaceAll(' ', '-') == hostLower ||
+              hostLower.contains('satelite') || hostLower.contains('mesh') || hostLower.contains('moto')) {
+            matchedNode = node;
+            break;
+          }
+        }
+
+        // Si tenemos un solo nodo en la lista y hay un cliente nuevo en rango DHCP (ej: 192.168.1.91)
+        if (matchedNode == null && _meshNodes.isNotEmpty) {
+          matchedNode = _meshNodes.first;
+        }
+
+        if (matchedNode != null) {
+          if (matchedNode.ip != ip) {
+            final oldIp = matchedNode.ip;
+            matchedNode.ip = ip;
+            if (matchedNode.mac.isEmpty) matchedNode.mac = lease.mac;
+            updatedCount++;
+            _showSnack('✔ Satélite detectado dinámicamente en IP $ip (anterior: $oldIp)');
+          }
+          await _checkNodeQuality(matchedNode);
+        }
+      }
+
+      if (updatedCount > 0) {
+        await _persistMeshNodes();
+      } else {
+        for (var n in _meshNodes) {
+          await _checkNodeQuality(n);
+        }
+        _showSnack('Escaneo completado. Satélites sincronizados.');
+      }
+    } catch (e) {
+      _showSnack('Error al auto-detectar satélites: $e', isError: true);
+    } finally {
+      setState(() => _isDiscoveringSatellites = false);
+    }
+  }
+
+  // TAB 3: Editar IP manualmente
+  Future<void> _editNodeIp(MeshNode node) async {
+    final ctrl = TextEditingController(text: node.ip);
+    final newIp = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: Text('Cambiar IP de ${node.name}', style: const TextStyle(color: Colors.white, fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Ingresa la dirección IP real asignada al satélite (ej: 192.168.1.91):', style: TextStyle(color: Colors.white70, fontSize: 13)),
+            const SizedBox(height: 12),
+            TextField(
+              controller: ctrl,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(
+                labelText: 'Dirección IP',
+                hintText: '192.168.1.91',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.router, color: Color(0xFF3B82F6)),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2563EB)),
+            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+            child: const Text('Guardar'),
+          ),
+        ],
+      ),
+    );
+
+    if (newIp != null && newIp.isNotEmpty && newIp != node.ip) {
+      setState(() => node.ip = newIp);
+      await _persistMeshNodes();
+      await _checkNodeQuality(node);
+      _showSnack('IP actualizada a $newIp en ${node.name}');
+    }
+  }
+
+  // TAB 3: Fijar IP a 192.168.1.2 en Router Principal y Satélite
+  Future<void> _fixNodeIpToTarget(MeshNode node, String targetIp) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: const Text('Fijar IP Estática en Satélite', style: TextStyle(color: Colors.white, fontSize: 16)),
+        content: Text(
+          '¿Deseas fijar la IP ${node.ip} a $targetIp permanentemente?\n\n'
+          'La app creará una reserva fija en el Router Principal y reconfigurará el satélite.',
+          style: const TextStyle(color: Colors.white70, fontSize: 13),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0284C7)),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Fijar IP'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      final pass = node.password.isNotEmpty ? node.password : _currentPassword;
+      _showSnack('Configurando reserva y asignando $targetIp al satélite...');
+      try {
+        await RouterService.fixSatelliteIp(
+          currentSatIp: node.ip,
+          satPassword: pass,
+          mainIp: _currentIp,
+          mainPassword: _currentPassword,
+          targetIp: targetIp,
+          satName: node.name,
+        );
+        setState(() => node.ip = targetIp);
+        await _persistMeshNodes();
+        _showSnack('✔ Satélite configurado en $targetIp. Reiniciando equipo...');
+      } catch (e) {
+        _showSnack('Error al fijar IP: $e', isError: true);
+      }
+    }
   }
 
   // TAB 3: Comprobar Calidad de un Nodo Satélite
@@ -2212,16 +2366,32 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 Text('Monitoreo en vivo y control individual de nodos', style: TextStyle(fontSize: 11, color: Colors.grey)),
               ],
             ),
-            ElevatedButton.icon(
-              onPressed: _isCheckingAllNodes ? null : _checkAllNodes,
-              icon: _isCheckingAllNodes
-                  ? const SizedBox(height: 16, width: 16, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                  : const Icon(Icons.refresh, size: 18),
-              label: const Text('Comprobar', style: TextStyle(fontSize: 12)),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF2563EB),
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              ),
+            Row(
+              children: [
+                ElevatedButton.icon(
+                  onPressed: _isDiscoveringSatellites ? null : _autoDiscoverSatellites,
+                  icon: _isDiscoveringSatellites
+                      ? const SizedBox(height: 14, width: 14, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                      : const Icon(Icons.radar, size: 16),
+                  label: const Text('Detectar IP', style: TextStyle(fontSize: 11)),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF0284C7),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton.icon(
+                  onPressed: _isCheckingAllNodes ? null : _checkAllNodes,
+                  icon: _isCheckingAllNodes
+                      ? const SizedBox(height: 14, width: 14, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                      : const Icon(Icons.refresh, size: 16),
+                  label: const Text('Comprobar', style: TextStyle(fontSize: 11)),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF2563EB),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
@@ -2293,7 +2463,40 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                           ),
                         ],
                       ),
-                      Text('IP: ${node.ip}', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                      Row(
+                        children: [
+                          Text('IP: ${node.ip}', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                          const SizedBox(width: 6),
+                          InkWell(
+                            onTap: () => _editNodeIp(node),
+                            child: const Padding(
+                              padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                              child: Row(
+                                children: [
+                                  Icon(Icons.edit, size: 12, color: Color(0xFF60A5FA)),
+                                  SizedBox(width: 2),
+                                  Text('Editar', style: TextStyle(fontSize: 10, color: Color(0xFF60A5FA), fontWeight: FontWeight.bold)),
+                                ],
+                              ),
+                            ),
+                          ),
+                          if (node.ip != '192.168.1.2') ...[
+                            const SizedBox(width: 6),
+                            InkWell(
+                              onTap: () => _fixNodeIpToTarget(node, '192.168.1.2'),
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF0284C7).withOpacity(0.2),
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(color: const Color(0xFF0284C7), width: 1),
+                                ),
+                                child: const Text('Fijar a .2', style: TextStyle(fontSize: 9, color: Color(0xFF38BDF8), fontWeight: FontWeight.bold)),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
                     ],
                   ),
                 ),
