@@ -67,7 +67,6 @@ class MeshNode {
     txPower: json['txPower'] ?? 23,
   );
 }
-}
 
 class MainNavigationScreen extends StatefulWidget {
   const MainNavigationScreen({super.key});
@@ -879,14 +878,14 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 borderRadius: BorderRadius.circular(10),
                 border: Border.all(color: Colors.white12),
               ),
-              child: const Column(
+              child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('• Solo Quitar de la Malla:', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF60A5FA), fontSize: 12)),
-                  Text('Elimina el nodo de la app y libera la IP ${node.ip} para futuros equipos.', style: TextStyle(color: Colors.grey, fontSize: 11)),
-                  SizedBox(height: 10),
-                  Text('• Restablecer a Fábrica y Quitar:', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.redAccent, fontSize: 12)),
-                  Text('Restaura el satélite a su configuración original (volverá a emitir su red Motorola-XXXX en 192.168.1.1) y lo elimina de la app.', style: TextStyle(color: Colors.grey, fontSize: 11)),
+                  const Text('• Solo Quitar de la Malla:', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF60A5FA), fontSize: 12)),
+                  Text('Elimina el nodo de la app y libera la IP ${node.ip} para futuros equipos.', style: const TextStyle(color: Colors.grey, fontSize: 11)),
+                  const SizedBox(height: 10),
+                  const Text('• Restablecer a Fábrica y Quitar:', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.redAccent, fontSize: 12)),
+                  const Text('Restaura el satélite a su configuración original (volverá a emitir su red Motorola-XXXX en 192.168.1.1) y lo elimina de la app.', style: TextStyle(color: Colors.grey, fontSize: 11)),
                 ],
               ),
             ),
