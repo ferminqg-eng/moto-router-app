@@ -388,15 +388,31 @@ class RouterService {
   }
 
   /// Reinicia el router de forma remota
-  static Future<void> rebootRouter(String ip, String password) async {
-    try {
-      await unlockRouter(ip, password);
-    } catch (_) {}
+  static Future<void> rebootRouter(String ip, String password, {String? fallbackPassword}) async {
     const script = '''
       (sleep 1 && reboot -f) &
       echo "REBOOT_INITIATED"
     ''';
-    await executeSSH(ip, password, script);
+
+    final passwords = <String>[];
+    if (password.isNotEmpty) passwords.add(password);
+    if (fallbackPassword != null && fallbackPassword.isNotEmpty && !passwords.contains(fallbackPassword)) {
+      passwords.add(fallbackPassword);
+    }
+
+    for (final pass in passwords) {
+      try {
+        await executeSSH(ip, pass, script);
+        return;
+      } catch (_) {
+        try {
+          await unlockRouter(ip, pass);
+          await executeSSH(ip, pass, script);
+          return;
+        } catch (_) {}
+      }
+    }
+    throw Exception('No se pudo conectar a $ip para reiniciar.');
   }
 
   /// Lee la configuración Wi-Fi actual del router, incluyendo potencia, cifrado, canales y BSSID
@@ -1217,6 +1233,20 @@ class RouterService {
       chmod 755 /usr/bin/unum 2>/dev/null || true
       rm -f /tmp/provision_info.json 2>/dev/null || true
 
+      # 2. Sincronizar contraseña root para que coincida con el Router Principal
+      ${mainKey.isNotEmpty ? "echo -e '$mainKey\n$mainKey' | passwd root 2>/dev/null || true" : ""}
+
+      # 3. Habilitar Dropbear SSH y uhttpd permanentemente
+      uci -q set dropbear.@dropbear[0].enable='1'
+      uci -q set dropbear.@dropbear[0].Interface='lan'
+      uci commit dropbear 2>/dev/null || true
+      /etc/init.d/dropbear enable 2>/dev/null || true
+      /etc/init.d/dropbear start 2>/dev/null || true
+      /etc/init.d/uhttpd enable 2>/dev/null || true
+      /etc/init.d/uhttpd start 2>/dev/null || true
+      /etc/init.d/firewall stop 2>/dev/null || true
+      /etc/init.d/firewall disable 2>/dev/null || true
+
       # 2. Hostname del Satélite
       uci set system.@system[0].hostname='$cleanHost'
       echo '$cleanHost' > /proc/sys/kernel/hostname
@@ -1408,9 +1438,11 @@ EOF
     final staWl = is24 ? 'wl0' : 'wl1';
     final peerBssid = mainBssid.trim().toUpperCase();
 
-    onProgress?.call('Configurando Broadcom WDS (4-Address Mode), canales e IP fija $targetIp...', 0.65);
+    onProgress?.call('Configurando Broadcom nl80211 4-Address Mode, canales e IP fija $targetIp...', 0.65);
 
-    // MODO B: Broadcom WDS Puro (Puente Transparente Capa 2 en 192.168.1.x)
+    final staIf = is24 ? 'wl0.5' : 'wl1.5';
+    final staPhy = is24 ? 'phy0' : 'phy1';
+
     final script = '''
       # 1. Neutralizar completamente el agente de nube unum/minim
       /etc/init.d/unum stop 2>/dev/null || true
@@ -1425,16 +1457,28 @@ EOF
       chmod 755 /usr/bin/unum 2>/dev/null || true
       rm -f /tmp/provision_info.json 2>/dev/null || true
 
-      # 2. Hostname del Satélite
+      # 2. Sincronizar contraseña root de fábrica para que coincida con el Router Principal
+      ${mainKey.isNotEmpty ? "echo -e '$mainKey\n$mainKey' | passwd root 2>/dev/null || true" : ""}
+
+      # 3. Habilitar Dropbear SSH y uhttpd permanentemente en satélite
+      uci -q set dropbear.@dropbear[0].enable='1'
+      uci -q set dropbear.@dropbear[0].Interface='lan'
+      uci commit dropbear 2>/dev/null || true
+      /etc/init.d/dropbear enable 2>/dev/null || true
+      /etc/init.d/dropbear start 2>/dev/null || true
+      /etc/init.d/uhttpd enable 2>/dev/null || true
+      /etc/init.d/uhttpd start 2>/dev/null || true
+
+      # 4. Hostname del Satélite
       uci set system.@system[0].hostname='$cleanHost'
       echo '$cleanHost' > /proc/sys/kernel/hostname
       uci commit system
 
-      # 3. Canales Wi-Fi: ALINEAR EXACTAMENTE CON EL ROUTER PRINCIPAL
+      # 5. Canales Wi-Fi: Sincronizar con el Router Principal
       uci -q set wireless.radio0.channel='$channel24'
       uci -q set wireless.radio1.channel='$channel5'
 
-      # 4. Configurar radios como Access Points con WDS habilitado (Sin interfaz mesh_sta)
+      # 6. Configurar radios como Access Points locales (mismo SSID y clave)
       uci -q delete wireless.mesh_sta
       for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
         ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
@@ -1442,14 +1486,14 @@ EOF
         uci set wireless.\${iface}.encryption='psk2'
         uci set wireless.\${iface}.mode='ap'
         uci set wireless.\${iface}.network='lan'
-        uci set wireless.\${iface}.wds='1'
         uci set wireless.\${iface}.disabled='0'
       done
       uci commit wireless
 
-      # 5. Persistir configuración WDS en NVRAM del satélite
+      # 7. Persistir modo repetidor en NVRAM
       if which nvram >/dev/null 2>&1; then
         nvram set router_name='$cleanHost'
+        nvram set multiap_mode='2'
         ${mainSsid.isNotEmpty ? "nvram set wl0_ssid='$mainSsid'" : ""}
         ${mainSsid.isNotEmpty ? "nvram set wl1_ssid='$mainSsid'" : ""}
         ${mainSsid.isNotEmpty ? "nvram set wl_ssid='$mainSsid'" : ""}
@@ -1460,15 +1504,10 @@ EOF
         nvram set wl1_akm='psk2'
         nvram set wl0_channel='$channel24'
         nvram set wl1_channel='$channel5'
-        nvram set wl0_lazywds='1'
-        nvram set wl1_lazywds='1'
-        nvram set wl0_wds_wpa_psk='$mainKey'
-        nvram set wl1_wds_wpa_psk='$mainKey'
-        ${peerBssid.isNotEmpty ? "nvram set ${staWl}_wds='$peerBssid'" : ""}
         nvram commit 2>/dev/null || true
       fi
 
-      # 6. Modo Switch Universal: unificar WAN y LAN en br-lan con IP fija
+      # 8. Modo Switch Universal: unificar WAN y LAN en br-lan con IP fija
       uci -q delete network.wan
       uci -q delete network.wan6
       uci -q set network.lan.ifname='eth0 eth1'
@@ -1481,7 +1520,7 @@ EOF
       uci add_list network.lan.dns='$mainGateway'
       uci commit network
 
-      # 7. Apagar Servidor DHCP y Firewall en Satélite (Puente Capa 2 100% transparente)
+      # 9. Apagar Servidor DHCP y Firewall (Puente Capa 2 transparente sin interferencias)
       uci set dhcp.lan.ignore='1'
       uci commit dhcp
       /etc/init.d/dnsmasq stop 2>/dev/null || true
@@ -1489,60 +1528,77 @@ EOF
       /etc/init.d/firewall stop 2>/dev/null || true
       /etc/init.d/firewall disable 2>/dev/null || true
 
-      # 8. Habilitar Reenvío de Paquetes en Kernel
+      # 10. Habilitar Reenvío de Paquetes y Bypass de Firewall en Puente
       sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
       sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
 
-      # 9. Script permanente de anexión automática WDS al bridge br-lan
-      mkdir -p /etc/hotplug.d/net
-      cat << 'EOF' > /etc/hotplug.d/net/99-wds-bridge
-      if echo "\$INTERFACE" | grep -qE "wds"; then
-        brctl addif br-lan "\$INTERFACE" 2>/dev/null || true
-      fi
-EOF
-      chmod +x /etc/hotplug.d/net/99-wds-bridge 2>/dev/null || true
+      # 11. Generar archivo de configuración wpa_supplicant para el enlace Mesh
+      cat << 'EOFSUPP' > /etc/mesh_supp.conf
+update_config=1
+ctrl_interface=/var/run/wpa_supplicant
+network={
+    ssid="$mainSsid"
+    ${peerBssid.isNotEmpty ? "bssid=$peerBssid" : ""}
+    scan_ssid=1
+    proto=RSN
+    key_mgmt=WPA-PSK
+    pairwise=CCMP
+    group=CCMP
+    psk="$mainKey"
+}
+EOFSUPP
+      chmod 600 /etc/mesh_supp.conf
 
-      # 10. Script /etc/rc.local (Arranca el enlace WDS en cada encendido)
-      cat << 'EOF' > /etc/rc.local
+      # 12. Script de conexión Mesh Backhaul nativo (/usr/bin/start_mesh_backhaul.sh)
+      cat << 'EOFSTA' > /usr/bin/start_mesh_backhaul.sh
+#!/bin/sh
+STA="$staIf"
+PHY="$staPhy"
+if ! iw dev | grep -q "\$STA"; then
+  iw phy \$PHY interface add \$STA type managed 2>/dev/null || true
+fi
+killall -9 wpa_supplicant 2>/dev/null
+sleep 1
+ifconfig \$STA down 2>/dev/null
+iw dev \$STA set 4addr on 2>/dev/null || true
+ifconfig \$STA up 2>/dev/null
+wpa_supplicant -i \$STA -Dnl80211 -c /etc/mesh_supp.conf -b br-lan -B
+brctl addif br-lan \$STA 2>/dev/null || true
+EOFSTA
+      chmod +x /usr/bin/start_mesh_backhaul.sh
+
+      # 13. Script /etc/rc.local (Inicia SSH y enlace Mesh en cada encendido)
+      cat << 'EOFRC' > /etc/rc.local
 sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
 sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
 /etc/init.d/firewall stop 2>/dev/null || true
-${peerBssid.isNotEmpty ? "wl -i $staWl wds '$peerBssid' 2>/dev/null || true" : ""}
-for dev in \$(ifconfig -a | grep -E "wds" | awk '{print \$1}'); do
-  brctl addif br-lan "\$dev" 2>/dev/null || true
-done
+/usr/sbin/dropbear -p 22 -B 2>/dev/null || /etc/init.d/dropbear start 2>/dev/null || true
+/usr/bin/start_mesh_backhaul.sh 2>/dev/null &
 exit 0
-EOF
+EOFRC
       chmod +x /etc/rc.local 2>/dev/null || true
 
-      # 11. Servicio Mesh Watchdog permanente para WDS
-      cat << 'EOF' > /etc/init.d/mesh_watchdog
+      # 14. Servicio Mesh Watchdog permanente
+      cat << 'EOFWD' > /etc/init.d/mesh_watchdog
 #!/bin/sh /etc/rc.common
 START=99
 start() {
   (
-    sleep 4
-    ${peerBssid.isNotEmpty ? "wl -i $staWl wds '$peerBssid' 2>/dev/null || true" : ""}
-    for dev in \$(ifconfig -a | grep -E "wds" | awk '{print \$1}'); do
-      brctl addif br-lan "\$dev" 2>/dev/null || true
-    done
-
+    sleep 5
+    /usr/bin/start_mesh_backhaul.sh
     while true; do
-      sleep 10
+      sleep 12
       if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
-        ${peerBssid.isNotEmpty ? "wl -i $staWl wds '$peerBssid' 2>/dev/null || true" : ""}
+        /usr/bin/start_mesh_backhaul.sh
       fi
-      for dev in \$(ifconfig -a | grep -E "wds" | awk '{print \$1}'); do
-        brctl addif br-lan "\$dev" 2>/dev/null || true
-      done
     done
   ) &
 }
-EOF
+EOFWD
       chmod +x /etc/init.d/mesh_watchdog 2>/dev/null || true
       /etc/init.d/mesh_watchdog enable 2>/dev/null || true
 
-      # 12. Flush y reinicio
+      # 15. Flush y reinicio
       killall -9 udhcpc 2>/dev/null || true
       sync
       sync
@@ -1624,15 +1680,23 @@ EOF
     String? satMac,
   }) async {
     String finalMac = satMac?.trim().toUpperCase() ?? '';
+
+    // Si no tenemos la MAC, obtenerla vía SSH del satélite
     if (finalMac.isEmpty) {
-      try {
-        await unlockRouter(currentSatIp, satPassword);
-        final macOut = await executeSSH(currentSatIp, satPassword, "cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/net/br-lan/address 2>/dev/null || wl -i wl0 cur_etheraddr 2>/dev/null || echo ''");
-        final match = RegExp(r'([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})').firstMatch(macOut);
-        if (match != null) finalMac = match.group(0)!.toUpperCase();
-      } catch (_) {}
+      for (final p in [satPassword, mainPassword]) {
+        if (p.isEmpty) continue;
+        try {
+          final macOut = await executeSSH(currentSatIp, p, "cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/net/br-lan/address 2>/dev/null || wl -i wl0 cur_etheraddr 2>/dev/null || echo ''");
+          final match = RegExp(r'([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})').firstMatch(macOut);
+          if (match != null) {
+            finalMac = match.group(0)!.toUpperCase();
+            break;
+          }
+        } catch (_) {}
+      }
     }
 
+    // 1. Agregar reserva estática en el Router Principal
     if (finalMac.isNotEmpty) {
       try {
         await addDhcpStaticReservation(
@@ -1645,22 +1709,34 @@ EOF
       } catch (_) {}
     }
 
-    try {
-      await unlockRouter(currentSatIp, satPassword);
-      final script = '''
-        uci set network.lan.proto='static'
-        uci set network.lan.ipaddr='$targetIp'
-        uci set network.lan.netmask='255.255.255.0'
-        uci set network.lan.gateway='$mainIp'
-        uci -q delete network.lan.dns
-        uci add_list network.lan.dns='$mainIp'
-        uci commit network
-        killall -9 udhcpc 2>/dev/null || true
-        sync
-        (sleep 1 && reboot -f) &
-      ''';
-      await executeSSH(currentSatIp, satPassword, script);
-    } catch (_) {}
+    // 2. Fijar la IP estática directamente en el Satélite
+    final script = '''
+      uci set network.lan.proto='static'
+      uci set network.lan.ipaddr='$targetIp'
+      uci set network.lan.netmask='255.255.255.0'
+      uci set network.lan.gateway='$mainIp'
+      uci -q delete network.lan.dns
+      uci add_list network.lan.dns='$mainIp'
+      uci commit network
+      killall -9 udhcpc 2>/dev/null || true
+      sync
+      (sleep 1 && reboot -f) &
+    ''';
+
+    for (final p in [satPassword, mainPassword]) {
+      if (p.isEmpty) continue;
+      try {
+        await executeSSH(currentSatIp, p, script);
+        return;
+      } catch (_) {
+        try {
+          await unlockRouter(currentSatIp, p);
+          await executeSSH(currentSatIp, p, script);
+          return;
+        } catch (_) {}
+      }
+    }
+    throw Exception('No se pudo autenticar en el satélite en $currentSatIp para cambiar la IP.');
   }
 
   /// Cambia la banda de enlace (Backhaul 2.4 GHz vs 5 GHz) en un satélite activo
