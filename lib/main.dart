@@ -1307,51 +1307,40 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       int updatedCount = 0;
 
       for (var lease in leases) {
-        final hostLower = lease.hostname.toLowerCase();
         final ip = lease.ip;
+        final mac = lease.mac.toLowerCase();
 
         if (ip == _currentIp) continue;
 
-        MeshNode? matchedNode;
+        // Solo actualizar IP si la MAC coincide exactamente y el nodo no tiene IP fija manual
         for (var node in _meshNodes) {
-          if (node.mac.isNotEmpty && node.mac.toLowerCase() == lease.mac.toLowerCase()) {
-            matchedNode = node;
+          if (node.mac.isNotEmpty && node.mac.toLowerCase() == mac) {
+            final isStandardStatic = node.ip.startsWith('192.168.1.2') || 
+                                     node.ip.startsWith('192.168.1.3') || 
+                                     node.ip.startsWith('192.168.1.4') || 
+                                     node.ip.startsWith('192.168.1.5');
+            if (node.ip != ip && !isStandardStatic) {
+              final oldIp = node.ip;
+              node.ip = ip;
+              updatedCount++;
+              _showSnack('✔ Satélite detectado dinámicamente en IP $ip (anterior: $oldIp)');
+            }
             break;
           }
-          if (node.name.toLowerCase().replaceAll(' ', '-') == hostLower ||
-              hostLower.contains('satelite') || hostLower.contains('mesh') || hostLower.contains('moto')) {
-            matchedNode = node;
-            break;
-          }
-        }
-
-        // Si tenemos un solo nodo en la lista y hay un cliente nuevo en rango DHCP (ej: 192.168.1.91)
-        if (matchedNode == null && _meshNodes.isNotEmpty) {
-          matchedNode = _meshNodes.first;
-        }
-
-        if (matchedNode != null) {
-          if (matchedNode.ip != ip) {
-            final oldIp = matchedNode.ip;
-            matchedNode.ip = ip;
-            if (matchedNode.mac.isEmpty) matchedNode.mac = lease.mac;
-            updatedCount++;
-            _showSnack('✔ Satélite detectado dinámicamente en IP $ip (anterior: $oldIp)');
-          }
-          await _checkNodeQuality(matchedNode);
         }
       }
 
       if (updatedCount > 0) {
         await _persistMeshNodes();
-      } else {
-        for (var n in _meshNodes) {
-          await _checkNodeQuality(n);
-        }
-        _showSnack('Escaneo completado. Satélites sincronizados.');
       }
+
+      // Probar conectividad y calidad de todos los nodos guardados
+      for (var n in _meshNodes) {
+        await _checkNodeQuality(n);
+      }
+      _showSnack('Escaneo completado. Satélites sincronizados.');
     } catch (e) {
-      _showSnack('Error al auto-detectar satélites: $e', isError: true);
+      _showSnack('Error al verificar satélites: $e', isError: true);
     } finally {
       setState(() => _isDiscoveringSatellites = false);
     }
@@ -1613,7 +1602,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     final pass = node.password.isNotEmpty ? node.password : _currentPassword;
     _showSnack('Enviando reinicio a ${node.name} (${node.ip})...');
     try {
-      await RouterService.rebootRouter(node.ip, pass);
+      await RouterService.rebootRouter(node.ip, pass, fallbackPassword: _currentPassword);
       _showSnack('✔ Reinicio ejecutado en ${node.name}. Reconectando en ~60s...');
     } catch (e) {
       _showSnack('Error al reiniciar ${node.name}: $e', isError: true);
