@@ -85,6 +85,7 @@ class MainNavigationScreen extends StatefulWidget {
 
 class _MainNavigationScreenState extends State<MainNavigationScreen> {
   bool _isConnected = false;
+  bool _loginPassObscure = true;
   String _currentIp = '192.168.1.1';
   String _currentPassword = '';
   RouterStatus? _status;
@@ -749,6 +750,14 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     );
 
     try {
+      final selectedBssid = _selectedBackhaulBand.contains('5')
+          ? (_mainBssid5.isNotEmpty ? _mainBssid5 : _mainBssid24)
+          : (_mainBssid24.isNotEmpty ? _mainBssid24 : _mainBssid5);
+
+      try {
+        await RouterService.prepareMainRouterForWds(_currentIp, _currentPassword);
+      } catch (_) {}
+
       final satMac = await RouterService.provisionSatelliteDirect(
         satIp: '192.168.1.1',
         satPassword: satPass,
@@ -759,6 +768,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         satName: satName,
         channel5: _mainChannel5,
         channel24: _mainChannel24,
+        mainBssid: selectedBssid,
         backhaulBand: _selectedBackhaulBand,
         onProgress: (step, percent) {
           if (mounted && setModalState != null) {
@@ -1146,16 +1156,16 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     return result;
   }
 
-  void _openQrScanner() {
+  void _openQrScanner({bool forLogin = false}) {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (ctx) => _buildQrScannerModal(ctx),
+      builder: (ctx) => _buildQrScannerModal(ctx, forLogin: forLogin),
     );
   }
 
-  Widget _buildQrScannerModal(BuildContext sheetCtx) {
+  Widget _buildQrScannerModal(BuildContext sheetCtx, {bool forLogin = false}) {
     final MobileScannerController controller = MobileScannerController(
       detectionSpeed: DetectionSpeed.normal,
       facing: CameraFacing.back,
@@ -1231,11 +1241,13 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                           final ssid = parsed['ssid'] ?? '';
 
                           setState(() {
-                            if (pass.isNotEmpty) {
-                              _addSatPassController.text = pass;
-                            }
-                            if (ssid.isNotEmpty && _addSatNameController.text == 'Equipo Sala') {
-                              _addSatNameController.text = 'Satélite $ssid';
+                            if (forLogin) {
+                              if (pass.isNotEmpty) _passController.text = pass;
+                            } else {
+                              if (pass.isNotEmpty) _addSatPassController.text = pass;
+                              if (ssid.isNotEmpty && _addSatNameController.text == 'Equipo Sala') {
+                                _addSatNameController.text = 'Satélite $ssid';
+                              }
                             }
                           });
 
@@ -1659,12 +1671,26 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                       const SizedBox(height: 14),
                       TextField(
                         controller: _passController,
-                        obscureText: true,
+                        obscureText: _loginPassObscure,
                         style: const TextStyle(color: Colors.white),
-                        decoration: const InputDecoration(
+                        decoration: InputDecoration(
                           labelText: 'Contraseña de fábrica (Etiqueta)',
-                          border: OutlineInputBorder(),
-                          prefixIcon: Icon(Icons.key, color: Color(0xFF3B82F6)),
+                          border: const OutlineInputBorder(),
+                          prefixIcon: const Icon(Icons.key, color: Color(0xFF3B82F6)),
+                          suffixIcon: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.qr_code_scanner, color: Color(0xFF60A5FA)),
+                                tooltip: 'Escanear QR de la Etiqueta',
+                                onPressed: () => _openQrScanner(forLogin: true),
+                              ),
+                              IconButton(
+                                icon: Icon(_loginPassObscure ? Icons.visibility : Icons.visibility_off, color: Colors.grey),
+                                onPressed: () => setState(() => _loginPassObscure = !_loginPassObscure),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                       const SizedBox(height: 20),
@@ -2376,20 +2402,6 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 const Text('2. Autorizar y Convertir', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
-                const SizedBox(height: 12),
-
-                OutlinedButton.icon(
-                  onPressed: _openQrScanner,
-                  icon: const Icon(Icons.qr_code_scanner, color: Color(0xFF60A5FA), size: 22),
-                  label: const Text('Escanear QR de la Etiqueta del Satélite', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF60A5FA), fontSize: 13)),
-                  style: OutlinedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    side: const BorderSide(color: Color(0xFF3B82F6), width: 1.5),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                    backgroundColor: const Color(0xFF1E3A8A).withOpacity(0.2),
-                  ),
-                ),
-
                 const SizedBox(height: 12),
 
                 TextField(
