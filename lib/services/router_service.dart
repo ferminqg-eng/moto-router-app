@@ -389,13 +389,14 @@ class RouterService {
 
   /// Reinicia el router de forma remota
   static Future<void> rebootRouter(String ip, String password) async {
+    try {
+      await unlockRouter(ip, password);
+    } catch (_) {}
     const script = '''
-      (sleep 1 && reboot) &
+      (sleep 1 && reboot -f) &
       echo "REBOOT_INITIATED"
     ''';
-    try {
-      await executeSSH(ip, password, script);
-    } catch (_) {}
+    await executeSSH(ip, password, script);
   }
 
   /// Lee la configuración Wi-Fi actual del router, incluyendo potencia, cifrado, canales y BSSID
@@ -1451,11 +1452,17 @@ EOF
       uci add_list network.lan.dns='$mainGateway'
       uci commit network
 
-      # 8. Apagar Servidor DHCP y dnsmasq para evitar conflictos de IP
+      # 8. Apagar Servidor DHCP y desactivar firewall para reenvío total de capa 2
       uci set dhcp.lan.ignore='1'
       uci commit dhcp
       /etc/init.d/dnsmasq stop 2>/dev/null || true
       /etc/init.d/dnsmasq disable 2>/dev/null || true
+      /etc/init.d/firewall stop 2>/dev/null || true
+      /etc/init.d/firewall disable 2>/dev/null || true
+
+      # Habilitar reenvío IP en el kernel y deshabilitar filtrado en bridge
+      sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+      sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
 
       # 9. Clonar emisión Wi-Fi en UCI
       for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
@@ -1493,21 +1500,43 @@ EOF
 EOF
       chmod +x /etc/hotplug.d/net/99-wds-bridge 2>/dev/null || true
 
-      # 13. Servicio Mesh Watchdog en arranque (Enlace continuo resiliente)
+      # 13. Script de arranque /etc/rc.local (Garantiza WET y anexión incondicional a br-lan al encender)
+      cat << 'EOF' > /etc/rc.local
+sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
+/etc/init.d/firewall stop 2>/dev/null || true
+wl -i $staWl wet 1 2>/dev/null || true
+${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
+for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
+  brctl addif br-lan "\$dev" 2>/dev/null || true
+done
+exit 0
+EOF
+      chmod +x /etc/rc.local 2>/dev/null || true
+
+      # 14. Servicio Mesh Watchdog en arranque (Enlace continuo resiliente)
       cat << 'EOF' > /etc/init.d/mesh_watchdog
 #!/bin/sh /etc/rc.common
 START=99
 start() {
   (
+    # Modo WET inicial inmediato
+    wl -i $staWl wet 1 2>/dev/null || true
+    ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
+    for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
+      brctl addif br-lan "\$dev" 2>/dev/null || true
+    done
+
     while true; do
       sleep 12
       if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
         wl -i $staWl wet 1 2>/dev/null || true
         ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
-        for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
-          brctl addif br-lan "\$dev" 2>/dev/null || true
-        done
       fi
+      # Asegurar en cada ciclo que las interfaces inalámbricas están anexadas a br-lan
+      for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
+        brctl addif br-lan "\$dev" 2>/dev/null || true
+      done
     done
   ) &
 }
@@ -1515,7 +1544,7 @@ EOF
       chmod +x /etc/init.d/mesh_watchdog 2>/dev/null || true
       /etc/init.d/mesh_watchdog enable 2>/dev/null || true
 
-      # 14. Flush de memoria y reinicio limpio del satélite para arrancar sin bloqueos en su nueva IP
+      # 15. Flush de memoria y reinicio limpio del satélite para arrancar sin bloqueos en su nueva IP
       sync
       sync
       (sleep 2 && reboot) &
@@ -1577,7 +1606,10 @@ EOF
       uci set dhcp.\${sec}.mac='$cleanMac'
       uci set dhcp.\${sec}.ip='$targetIp'
       uci commit dhcp
-      /etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/dnsmasq restart
+      # Limpiar lease dinámico previo para forzar la nueva IP estática de inmediato
+      sed -i "/$cleanMac/Id" /tmp/dhcp.leases 2>/dev/null || true
+      sed -i "/$cleanMac/Id" /var/dhcp.leases 2>/dev/null || true
+      /etc/init.d/dnsmasq restart
     ''';
     await executeSSH(mainIp, mainPassword, script);
   }
@@ -1590,39 +1622,44 @@ EOF
     required String mainPassword,
     required String targetIp,
     required String satName,
+    String? satMac,
   }) async {
-    String satMac = '';
-    try {
-      final macOut = await executeSSH(currentSatIp, satPassword, "cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/net/br-lan/address 2>/dev/null || wl -i wl0 cur_etheraddr 2>/dev/null || echo ''");
-      final match = RegExp(r'([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})').firstMatch(macOut);
-      if (match != null) satMac = match.group(0)!.toUpperCase();
-    } catch (_) {}
+    String finalMac = satMac?.trim().toUpperCase() ?? '';
+    if (finalMac.isEmpty) {
+      try {
+        await unlockRouter(currentSatIp, satPassword);
+        final macOut = await executeSSH(currentSatIp, satPassword, "cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/net/br-lan/address 2>/dev/null || wl -i wl0 cur_etheraddr 2>/dev/null || echo ''");
+        final match = RegExp(r'([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})').firstMatch(macOut);
+        if (match != null) finalMac = match.group(0)!.toUpperCase();
+      } catch (_) {}
+    }
 
-    if (satMac.isNotEmpty) {
+    if (finalMac.isNotEmpty) {
       try {
         await addDhcpStaticReservation(
           mainIp: mainIp,
           mainPassword: mainPassword,
-          mac: satMac,
+          mac: finalMac,
           targetIp: targetIp,
           hostname: satName,
         );
       } catch (_) {}
     }
 
-    final script = '''
-      uci set network.lan.proto='static'
-      uci set network.lan.ipaddr='$targetIp'
-      uci set network.lan.netmask='255.255.255.0'
-      uci set network.lan.gateway='$mainIp'
-      uci -q delete network.lan.dns
-      uci add_list network.lan.dns='$mainIp'
-      uci commit network
-      sync
-      (/etc/init.d/network restart) &
-      (sleep 2 && reboot) &
-    ''';
     try {
+      await unlockRouter(currentSatIp, satPassword);
+      final script = '''
+        uci set network.lan.proto='static'
+        uci set network.lan.ipaddr='$targetIp'
+        uci set network.lan.netmask='255.255.255.0'
+        uci set network.lan.gateway='$mainIp'
+        uci -q delete network.lan.dns
+        uci add_list network.lan.dns='$mainIp'
+        uci commit network
+        killall -9 udhcpc 2>/dev/null || true
+        sync
+        (sleep 1 && reboot -f) &
+      ''';
       await executeSSH(currentSatIp, satPassword, script);
     } catch (_) {}
   }
@@ -1651,20 +1688,39 @@ EOF
       uci set wireless.mesh_sta.encryption='psk2'
       uci commit wireless
 
+      cat << 'EOF' > /etc/rc.local
+sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
+/etc/init.d/firewall stop 2>/dev/null || true
+wl -i $staWl wet 1 2>/dev/null || true
+${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
+for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
+  brctl addif br-lan "\$dev" 2>/dev/null || true
+done
+exit 0
+EOF
+      chmod +x /etc/rc.local 2>/dev/null || true
+
       cat << 'EOF' > /etc/init.d/mesh_watchdog
 #!/bin/sh /etc/rc.common
 START=99
 start() {
   (
+    wl -i $staWl wet 1 2>/dev/null || true
+    ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
+    for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
+      brctl addif br-lan "\$dev" 2>/dev/null || true
+    done
+
     while true; do
       sleep 12
       if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
         wl -i $staWl wet 1 2>/dev/null || true
         ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
-        for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
-          brctl addif br-lan "\$dev" 2>/dev/null || true
-        done
       fi
+      for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
+        brctl addif br-lan "\$dev" 2>/dev/null || true
+      done
     done
   ) &
 }
@@ -1676,6 +1732,7 @@ EOF
     ''';
 
     try {
+      await unlockRouter(satIp, satPassword);
       await executeSSH(satIp, satPassword, script);
     } catch (_) {}
   }
