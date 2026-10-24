@@ -360,6 +360,16 @@ class RouterService {
       killall -9 minimd 2>/dev/null || true
       chmod 644 /usr/bin/unum 2>/dev/null || true
       rm -f /tmp/provision_info.json 2>/dev/null || true
+
+      # Garantizar entrega instantánea de DHCP en el puerto LAN físico (eth1)
+      uci -q set dhcp.lan.ignore='0'
+      uci -q set dhcp.lan.authoritative='1'
+      uci -q set dhcp.@dnsmasq[0].authoritative='1'
+      uci commit dhcp 2>/dev/null || true
+      uci -q set network.lan.stp='0'
+      uci commit network 2>/dev/null || true
+      brctl stp br-lan off 2>/dev/null || true
+      /etc/init.d/dnsmasq restart 2>/dev/null || true
     ''';
     await executeSSH(ip, password, script);
   }
@@ -749,9 +759,14 @@ class RouterService {
 
     if (cfg.dhcpEnabled) {
       commands.add("uci set dhcp.lan.ignore='0'");
+      commands.add("uci -q set dhcp.lan.authoritative='1'");
+      commands.add("uci -q set dhcp.@dnsmasq[0].authoritative='1'");
       commands.add("uci set dhcp.lan.start='${cfg.start}'");
       commands.add("uci set dhcp.lan.limit='${cfg.limit}'");
       commands.add("uci commit dhcp");
+      commands.add("uci -q set network.lan.stp='0'");
+      commands.add("uci commit network 2>/dev/null || true");
+      commands.add("brctl stp br-lan off 2>/dev/null || true");
       commands.add("/etc/init.d/dnsmasq enable 2>/dev/null || true");
       commands.add("/etc/init.d/dnsmasq restart");
     } else {
@@ -1389,10 +1404,20 @@ EOF
       wl -i wl0 lazywds 1 2>/dev/null || true
       wl -i wl1 lazywds 1 2>/dev/null || true
 
-      # 3. Anexar cualquier interfaz WDS activa a br-lan
-      for dev in \$(ifconfig -a | grep -E "wds" | awk '{print \$1}'); do
+      # 3. Anexar cualquier interfaz WDS o estación mesh a br-lan
+      for dev in \$(ifconfig -a | grep -E "wds|wl1.5|wl0.5" | awk '{print \$1}'); do
         brctl addif br-lan "\$dev" 2>/dev/null || true
       done
+
+      # 4. Asegurar que el puerto LAN (eth1) y DHCP entreguen inmediatamente
+      uci -q set dhcp.lan.ignore='0'
+      uci -q set dhcp.lan.authoritative='1'
+      uci -q set dhcp.@dnsmasq[0].authoritative='1'
+      uci commit dhcp 2>/dev/null || true
+      uci -q set network.lan.stp='0'
+      uci commit network 2>/dev/null || true
+      brctl stp br-lan off 2>/dev/null || true
+      /etc/init.d/dnsmasq restart 2>/dev/null || true
     ''';
     try {
       await executeSSH(mainIp, mainPassword, script);
