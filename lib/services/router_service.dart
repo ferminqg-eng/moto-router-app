@@ -428,13 +428,17 @@ class RouterService {
   /// Lee la configuración Wi-Fi actual del router, incluyendo potencia, cifrado, canales y BSSID
   static Future<WifiConfigData> getWifiConfig(String ip, String password) async {
     const script = '''
-      echo "===WIRELESS===" && uci show wireless
+      echo "===SSID0===" && (wl -i wl0 ssid 2>/dev/null | tr -d '"' || nvram get wl0_ssid || uci -q get wireless.default_wl0.ssid || echo "")
+      echo "===SSID1===" && (wl -i wl1 ssid 2>/dev/null | tr -d '"' || nvram get wl1_ssid || uci -q get wireless.default_wl1.ssid || echo "")
+      echo "===KEY0===" && (nvram get wl0_wpa_psk || uci -q get wireless.default_wl0.key || echo "")
+      echo "===KEY1===" && (nvram get wl1_wpa_psk || uci -q get wireless.default_wl1.key || echo "")
       echo "===TXPOWER===" && uci -q get wireless.radio0.txpower || echo "23"
       echo "===LEGACY===" && uci -q get wireless.radio0.legacy_mode || echo "0"
       echo "===CHAN0===" && (wl -i wl0 channel 2>/dev/null || uci -q get wireless.radio0.channel || echo "6")
       echo "===CHAN1===" && (wl -i wl1 channel 2>/dev/null || uci -q get wireless.radio1.channel || echo "36")
       echo "===BSSID0===" && (wl -i wl0 cur_etheraddr 2>/dev/null || cat /sys/class/net/eth1/address 2>/dev/null || echo "")
       echo "===BSSID1===" && (wl -i wl1 cur_etheraddr 2>/dev/null || cat /sys/class/net/eth2/address 2>/dev/null || echo "")
+      echo "===WIRELESS===" && uci show wireless
     ''';
     final output = await executeSSH(ip, password, script);
 
@@ -445,6 +449,10 @@ class RouterService {
     for (int i = 1; i < parts.length; i += 2) {
       final tag = parts[i].trim();
       final val = i + 1 < parts.length ? parts[i + 1].trim() : '';
+      if (tag == 'SSID0' && val.isNotEmpty && !val.toLowerCase().contains('guest')) config.ssid24 = val;
+      if (tag == 'SSID1' && val.isNotEmpty && !val.toLowerCase().contains('guest')) config.ssid5 = val;
+      if (tag == 'KEY0' && val.isNotEmpty) config.key24 = val;
+      if (tag == 'KEY1' && val.isNotEmpty) config.key5 = val;
       if (tag == 'WIRELESS') wirelessOutput = val;
       if (tag == 'TXPOWER') config.txPower = int.tryParse(val) ?? 23;
       if (tag == 'LEGACY') config.legacyMode = (val == '1');
@@ -480,25 +488,27 @@ class RouterService {
       }
     }
 
-    // Identificar 2.4GHz y 5GHz
-    for (var entry in ifaces.values) {
-      final dev = entry['device'] ?? '';
-      final ssid = entry['ssid'] ?? '';
-      final key = entry['key'] ?? '';
-      final enc = entry['encryption'] ?? 'psk2';
+    // Identificar 2.4GHz y 5GHz ignorando COMPLETAMENTE interfaces de invitados (guest)
+    for (var entry in ifaces.entries) {
+      if (entry.key.toLowerCase().contains('guest')) continue;
+      final dev = entry.value['device'] ?? '';
+      final ssid = entry.value['ssid'] ?? '';
+      final key = entry.value['key'] ?? '';
+      final enc = entry.value['encryption'] ?? 'psk2';
+      if (ssid.toLowerCase().contains('guest')) continue;
 
       if (dev.contains('5') || dev.contains('1') || dev.toLowerCase().contains('wlan1') || dev.contains('radio1')) {
-        config.ssid5 = ssid;
-        config.key5 = key;
+        if (config.ssid5.isEmpty) config.ssid5 = ssid;
+        if (config.key5.isEmpty) config.key5 = key;
         config.enc5 = enc;
       } else {
-        config.ssid24 = ssid;
-        config.key24 = key;
+        if (config.ssid24.isEmpty) config.ssid24 = ssid;
+        if (config.key24.isEmpty) config.key24 = key;
         config.enc24 = enc;
       }
     }
 
-    // Si solo hay una configurada, replicarla
+    // Replicar si una banda viene vacía
     if (config.ssid5.isEmpty && config.ssid24.isNotEmpty) {
       config.ssid5 = config.ssid24;
       config.key5 = config.key24;
@@ -640,7 +650,7 @@ class RouterService {
       # Ping para latencia
       ping -c 3 -W 1 $satIp 2>/dev/null || echo "PING_FAIL"
       echo "===ARP===" && cat /proc/net/arp | grep -w '$satIp' || true
-      echo "===IW===" && (iw dev wlan0 station dump 2>/dev/null; iw dev wlan1 station dump 2>/dev/null) || true
+      echo "===IW===" && (iw dev wl0 station dump 2>/dev/null; iw dev wl1 station dump 2>/dev/null; iw dev wlan0 station dump 2>/dev/null; iw dev wlan1 station dump 2>/dev/null; wl -i wl0 assoclist 2>/dev/null; wl -i wl1 assoclist 2>/dev/null) || true
     ''';
 
     final output = await executeSSH(mainIp, mainPassword, script);
@@ -1436,7 +1446,7 @@ EOF
     int channel5 = 36,
     int channel24 = 6,
     String mainBssid = '',
-    String backhaulBand = '2.4 GHz',
+    String backhaulBand = '5 GHz',
     void Function(String step, double progress)? onProgress,
   }) async {
     onProgress?.call('Conectando a LuCI en $satIp y arrancando Dropbear SSH...', 0.20);
@@ -1458,15 +1468,7 @@ EOF
     final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
     final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
 
-    final is24 = !backhaulBand.contains('5');
-    final staRadio = is24 ? 'radio0' : 'radio1';
-    final staWl = is24 ? 'wl0' : 'wl1';
-    final peerBssid = mainBssid.trim().toUpperCase();
-
-    onProgress?.call('Configurando Broadcom nl80211 4-Address Mode, canales e IP fija $targetIp...', 0.65);
-
-    final staIf = is24 ? 'wl0.5' : 'wl1.5';
-    final staPhy = is24 ? 'phy0' : 'phy1';
+    onProgress?.call('Configurando Broadcom Mesh Backhaul (wl1.5 5GHz 4-Address), canales e IP $targetIp...', 0.65);
 
     final script = '''
       # 1. Neutralizar completamente el agente de nube unum/minim
@@ -1532,7 +1534,7 @@ EOF
         nvram commit 2>/dev/null || true
       fi
 
-      # 8. Modo Switch Universal: unificar WAN y LAN en br-lan con IP fija
+      # 8. Modo Switch Universal: unificar WAN (eth0) y LAN (eth1) en br-lan con IP fija
       uci -q delete network.wan
       uci -q delete network.wan6
       uci -q set network.lan.ifname='eth0 eth1'
@@ -1543,6 +1545,7 @@ EOF
       uci -q set network.lan.gateway='$mainGateway'
       uci -q delete network.lan.dns
       uci add_list network.lan.dns='$mainGateway'
+      uci -q set network.lan.stp='0'
       uci commit network
 
       # 9. Apagar Servidor DHCP y Firewall (Puente Capa 2 transparente sin interferencias)
@@ -1563,7 +1566,6 @@ update_config=1
 ctrl_interface=/var/run/wpa_supplicant
 network={
     ssid="$mainSsid"
-    ${peerBssid.isNotEmpty ? "bssid=$peerBssid" : ""}
     scan_ssid=1
     proto=RSN
     key_mgmt=WPA-PSK
@@ -1574,21 +1576,17 @@ network={
 EOFSUPP
       chmod 600 /etc/mesh_supp.conf
 
-      # 12. Script de conexión Mesh Backhaul nativo (/usr/bin/start_mesh_backhaul.sh)
+      # 12. Script de conexión Mesh Backhaul nativo en wl1.5 (/usr/bin/start_mesh_backhaul.sh)
       cat << 'EOFSTA' > /usr/bin/start_mesh_backhaul.sh
 #!/bin/sh
-STA="$staIf"
-PHY="$staPhy"
-if ! iw dev | grep -q "\$STA"; then
-  iw phy \$PHY interface add \$STA type managed 2>/dev/null || true
-fi
 killall -9 wpa_supplicant 2>/dev/null
 sleep 1
-ifconfig \$STA down 2>/dev/null
-iw dev \$STA set 4addr on 2>/dev/null || true
-ifconfig \$STA up 2>/dev/null
-wpa_supplicant -i \$STA -Dnl80211 -c /etc/mesh_supp.conf -b br-lan -B
-brctl addif br-lan \$STA 2>/dev/null || true
+ifconfig wl1.5 down 2>/dev/null
+iw dev wl1.5 set 4addr on 2>/dev/null || true
+ifconfig wl1.5 up 2>/dev/null
+wpa_supplicant -i wl1.5 -Dnl80211 -c /etc/mesh_supp.conf -b br-lan -B
+sleep 2
+brctl addif br-lan wl1.5 2>/dev/null || true
 EOFSTA
       chmod +x /usr/bin/start_mesh_backhaul.sh
 
@@ -1616,6 +1614,7 @@ start() {
       if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
         /usr/bin/start_mesh_backhaul.sh
       fi
+      brctl addif br-lan wl1.5 2>/dev/null || true
     done
   ) &
 }
