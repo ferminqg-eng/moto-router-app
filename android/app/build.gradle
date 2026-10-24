@@ -40,8 +40,8 @@ android {
         applicationId = "com.lanrouter.management"
         minSdk = 21
         targetSdk = 36
-        versionCode = 23
-        versionName = "2.9.6"
+        versionCode = 24
+        versionName = "2.9.7"
     }
 
     buildTypes {
