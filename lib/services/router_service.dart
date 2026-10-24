@@ -1343,6 +1343,33 @@ EOF
   /// Aprovisionamiento Guiado Directo del Satélite desde el teléfono
   /// (Conectado a la red de fábrica en 192.168.1.1)
   /// Alinea canales con router principal, activa WDS bidireccional, clona NVRAM y unifica br-lan
+  /// Prepara el Router Principal para aceptar conexiones WDS transparentes de satélites
+  static Future<void> prepareMainRouterForWds(String mainIp, String mainPassword) async {
+    const script = '''
+      # 1. Hotplug para auto-anexar interfaces wds al puente br-lan
+      mkdir -p /etc/hotplug.d/net
+      cat << 'EOF' > /etc/hotplug.d/net/99-wds-bridge
+      if echo "\$INTERFACE" | grep -qE "wds"; then
+        brctl addif br-lan "\$INTERFACE" 2>/dev/null || true
+      fi
+EOF
+      chmod +x /etc/hotplug.d/net/99-wds-bridge 2>/dev/null || true
+
+      # 2. Habilitar lazywds en radios Broadcom
+      wl -i wl0 lazywds 1 2>/dev/null || true
+      wl -i wl1 lazywds 1 2>/dev/null || true
+
+      # 3. Anexar cualquier interfaz WDS activa a br-lan
+      for dev in \$(ifconfig -a | grep -E "wds" | awk '{print \$1}'); do
+        brctl addif br-lan "\$dev" 2>/dev/null || true
+      done
+    ''';
+    try {
+      await executeSSH(mainIp, mainPassword, script);
+    } catch (_) {}
+  }
+
+  /// Alinea canales con router principal, activa WDS bidireccional, clona NVRAM y unifica br-lan
   static Future<String> provisionSatelliteDirect({
     required String satIp,
     required String satPassword,
@@ -1379,12 +1406,13 @@ EOF
     final is24 = !backhaulBand.contains('5');
     final staRadio = is24 ? 'radio0' : 'radio1';
     final staWl = is24 ? 'wl0' : 'wl1';
+    final peerBssid = mainBssid.trim().toUpperCase();
 
-    onProgress?.call('Inyectando configuración Mesh (Backhaul $backhaulBand), canales e IP $targetIp...', 0.65);
+    onProgress?.call('Configurando Broadcom WDS (4-Address Mode), canales e IP fija $targetIp...', 0.65);
 
-    // PASO 2: Configuración Mesh WDS completa
+    // MODO B: Broadcom WDS Puro (Puente Transparente Capa 2 en 192.168.1.x)
     final script = '''
-      # 1. Neutralizar completamente el agente de nube unum/minim de forma segura sin romper procd
+      # 1. Neutralizar completamente el agente de nube unum/minim
       /etc/init.d/unum stop 2>/dev/null || true
       /etc/init.d/unum disable 2>/dev/null || true
       /etc/init.d/minim stop 2>/dev/null || true
@@ -1397,7 +1425,7 @@ EOF
       chmod 755 /usr/bin/unum 2>/dev/null || true
       rm -f /tmp/provision_info.json 2>/dev/null || true
 
-      # 2. Nombre del Satélite
+      # 2. Hostname del Satélite
       uci set system.@system[0].hostname='$cleanHost'
       echo '$cleanHost' > /proc/sys/kernel/hostname
       uci commit system
@@ -1405,10 +1433,21 @@ EOF
       # 3. Canales Wi-Fi: ALINEAR EXACTAMENTE CON EL ROUTER PRINCIPAL
       uci -q set wireless.radio0.channel='$channel24'
       uci -q set wireless.radio1.channel='$channel5'
-      uci -q delete wireless.radio0.wds
-      uci -q delete wireless.radio1.wds
 
-      # 4. Persistir en NVRAM del satélite (sin corromper wl0_wds con valores inválidos)
+      # 4. Configurar radios como Access Points con WDS habilitado (Sin interfaz mesh_sta)
+      uci -q delete wireless.mesh_sta
+      for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
+        ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
+        ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
+        uci set wireless.\${iface}.encryption='psk2'
+        uci set wireless.\${iface}.mode='ap'
+        uci set wireless.\${iface}.network='lan'
+        uci set wireless.\${iface}.wds='1'
+        uci set wireless.\${iface}.disabled='0'
+      done
+      uci commit wireless
+
+      # 5. Persistir configuración WDS en NVRAM del satélite
       if which nvram >/dev/null 2>&1; then
         nvram set router_name='$cleanHost'
         ${mainSsid.isNotEmpty ? "nvram set wl0_ssid='$mainSsid'" : ""}
@@ -1423,36 +1462,26 @@ EOF
         nvram set wl1_channel='$channel5'
         nvram set wl0_lazywds='1'
         nvram set wl1_lazywds='1'
-        nvram unset wl0_wds 2>/dev/null || true
-        nvram unset wl1_wds 2>/dev/null || true
+        nvram set wl0_wds_wpa_psk='$mainKey'
+        nvram set wl1_wds_wpa_psk='$mainKey'
+        ${peerBssid.isNotEmpty ? "nvram set ${staWl}_wds='$peerBssid'" : ""}
         nvram commit 2>/dev/null || true
       fi
 
-      # 5. Inyección en caliente a los radios Broadcom del satélite
-      wl -i wl0 channel $channel24 2>/dev/null || true
-      wl -i wl1 channel $channel5 2>/dev/null || true
-      ${mainSsid.isNotEmpty ? "wl -i wl0 ssid '$mainSsid' 2>/dev/null || true" : ""}
-      ${mainSsid.isNotEmpty ? "wl -i wl1 ssid '$mainSsid' 2>/dev/null || true" : ""}
-      ${mainKey.isNotEmpty ? "wl -i wl0 wpa_psk '$mainKey' 2>/dev/null || true" : ""}
-      ${mainKey.isNotEmpty ? "wl -i wl1 wpa_psk '$mainKey' 2>/dev/null || true" : ""}
-      wl -i wl0 lazywds 1 2>/dev/null || true
-      wl -i wl1 lazywds 1 2>/dev/null || true
-
-      # 6. Unificar puertos WAN (eth1) y LAN (eth0) en br-lan (Modo Switch total transparente)
+      # 6. Modo Switch Universal: unificar WAN y LAN en br-lan con IP fija
       uci -q delete network.wan
       uci -q delete network.wan6
       uci -q set network.lan.ifname='eth0 eth1'
       uci -q set network.lan.type='bridge'
-
-      # 7. Configurar IP fija final y Puerta de enlace al Router Principal
-      uci set network.lan.ipaddr='$targetIp'
-      uci set network.lan.netmask='255.255.255.0'
-      uci set network.lan.gateway='$mainGateway'
+      uci -q set network.lan.proto='static'
+      uci -q set network.lan.ipaddr='$targetIp'
+      uci -q set network.lan.netmask='255.255.255.0'
+      uci -q set network.lan.gateway='$mainGateway'
       uci -q delete network.lan.dns
       uci add_list network.lan.dns='$mainGateway'
       uci commit network
 
-      # 8. Apagar Servidor DHCP y desactivar firewall para reenvío total de capa 2
+      # 7. Apagar Servidor DHCP y Firewall en Satélite (Puente Capa 2 100% transparente)
       uci set dhcp.lan.ignore='1'
       uci commit dhcp
       /etc/init.d/dnsmasq stop 2>/dev/null || true
@@ -1460,81 +1489,50 @@ EOF
       /etc/init.d/firewall stop 2>/dev/null || true
       /etc/init.d/firewall disable 2>/dev/null || true
 
-      # Habilitar reenvío IP en el kernel y deshabilitar filtrado en bridge
+      # 8. Habilitar Reenvío de Paquetes en Kernel
       sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
       sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
 
-      # 9. Clonar emisión Wi-Fi en UCI
-      for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
-        ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
-        ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
-        uci set wireless.\${iface}.encryption='psk2'
-        uci set wireless.\${iface}.disabled='0'
-        uci -q delete wireless.\${iface}.wds
-      done
-
-      # 10. Configurar enlace cliente inalámbrico (Backhaul STA en $staRadio) hacia el Router Principal
-      uci -q delete wireless.mesh_sta
-      uci set wireless.mesh_sta=wifi-iface
-      uci set wireless.mesh_sta.device='$staRadio'
-      uci set wireless.mesh_sta.mode='sta'
-      uci set wireless.mesh_sta.network='lan'
-      ${mainSsid.isNotEmpty ? "uci set wireless.mesh_sta.ssid='$mainSsid'" : ""}
-      ${mainKey.isNotEmpty ? "uci set wireless.mesh_sta.key='$mainKey'" : ""}
-      uci set wireless.mesh_sta.encryption='psk2'
-      uci commit wireless
-
-      # 11. Claves de enlace WDS en NVRAM
-      if which nvram >/dev/null 2>&1; then
-        ${mainKey.isNotEmpty ? "nvram set wl0_wds_wpa_psk='$mainKey'" : ""}
-        ${mainKey.isNotEmpty ? "nvram set wl1_wds_wpa_psk='$mainKey'" : ""}
-        nvram commit 2>/dev/null || true
-      fi
-
-      # 12. Script permanente de anexión automática WDS/mesh al bridge br-lan
+      # 9. Script permanente de anexión automática WDS al bridge br-lan
       mkdir -p /etc/hotplug.d/net
       cat << 'EOF' > /etc/hotplug.d/net/99-wds-bridge
-      if echo "\$INTERFACE" | grep -qE "wds|wl"; then
+      if echo "\$INTERFACE" | grep -qE "wds"; then
         brctl addif br-lan "\$INTERFACE" 2>/dev/null || true
       fi
 EOF
       chmod +x /etc/hotplug.d/net/99-wds-bridge 2>/dev/null || true
 
-      # 13. Script de arranque /etc/rc.local (Garantiza WET y anexión incondicional a br-lan al encender)
+      # 10. Script /etc/rc.local (Arranca el enlace WDS en cada encendido)
       cat << 'EOF' > /etc/rc.local
 sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
 sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
 /etc/init.d/firewall stop 2>/dev/null || true
-wl -i $staWl wet 1 2>/dev/null || true
-${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
-for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
+${peerBssid.isNotEmpty ? "wl -i $staWl wds '$peerBssid' 2>/dev/null || true" : ""}
+for dev in \$(ifconfig -a | grep -E "wds" | awk '{print \$1}'); do
   brctl addif br-lan "\$dev" 2>/dev/null || true
 done
 exit 0
 EOF
       chmod +x /etc/rc.local 2>/dev/null || true
 
-      # 14. Servicio Mesh Watchdog en arranque (Enlace continuo resiliente)
+      # 11. Servicio Mesh Watchdog permanente para WDS
       cat << 'EOF' > /etc/init.d/mesh_watchdog
 #!/bin/sh /etc/rc.common
 START=99
 start() {
   (
-    # Modo WET inicial inmediato
-    wl -i $staWl wet 1 2>/dev/null || true
-    ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
-    for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
+    sleep 4
+    ${peerBssid.isNotEmpty ? "wl -i $staWl wds '$peerBssid' 2>/dev/null || true" : ""}
+    for dev in \$(ifconfig -a | grep -E "wds" | awk '{print \$1}'); do
       brctl addif br-lan "\$dev" 2>/dev/null || true
     done
 
     while true; do
-      sleep 12
+      sleep 10
       if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
-        wl -i $staWl wet 1 2>/dev/null || true
-        ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
+        ${peerBssid.isNotEmpty ? "wl -i $staWl wds '$peerBssid' 2>/dev/null || true" : ""}
       fi
-      # Asegurar en cada ciclo que las interfaces inalámbricas están anexadas a br-lan
-      for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
+      for dev in \$(ifconfig -a | grep -E "wds" | awk '{print \$1}'); do
         brctl addif br-lan "\$dev" 2>/dev/null || true
       done
     done
@@ -1544,10 +1542,11 @@ EOF
       chmod +x /etc/init.d/mesh_watchdog 2>/dev/null || true
       /etc/init.d/mesh_watchdog enable 2>/dev/null || true
 
-      # 15. Flush de memoria y reinicio limpio del satélite para arrancar sin bloqueos en su nueva IP
+      # 12. Flush y reinicio
+      killall -9 udhcpc 2>/dev/null || true
       sync
       sync
-      (sleep 2 && reboot) &
+      (sleep 2 && reboot -f) &
     ''';
 
     try {
