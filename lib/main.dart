@@ -1478,6 +1478,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
           mainPassword: _currentPassword,
           targetIp: targetIp,
           satName: node.name,
+          satMac: node.mac,
         );
         setState(() => node.ip = targetIp);
         await _persistMeshNodes();
@@ -1598,11 +1599,12 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     if (confirm != true) return;
 
     final pass = node.password.isNotEmpty ? node.password : _currentPassword;
+    _showSnack('Enviando reinicio a ${node.name} (${node.ip})...');
     try {
       await RouterService.rebootRouter(node.ip, pass);
-      _showSnack('Reinicio enviado a ${node.name}');
-    } catch (_) {
-      _showSnack('Reinicio iniciado en ${node.name}');
+      _showSnack('✔ Reinicio ejecutado en ${node.name}. Reconectando en ~60s...');
+    } catch (e) {
+      _showSnack('Error al reiniciar ${node.name}: $e', isError: true);
     }
   }
 
@@ -2331,6 +2333,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   value: _selectedBackhaulBand,
                   dropdownColor: const Color(0xFF1E293B),
                   style: const TextStyle(color: Colors.white, fontSize: 13),
+                  isExpanded: true,
                   decoration: const InputDecoration(
                     border: OutlineInputBorder(),
                     isDense: true,
@@ -2339,16 +2342,23 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   items: const [
                     DropdownMenuItem(
                       value: '2.4 GHz',
-                      child: Text('🟢 2.4 GHz - Máximo Alcance (Atraviesa Paredes de Concreto)'),
+                      child: Text('🟢 2.4 GHz (Mayor Cobertura / Muros)', overflow: TextOverflow.ellipsis),
                     ),
                     DropdownMenuItem(
                       value: '5 GHz',
-                      child: Text('⚡ 5 GHz - Máxima Velocidad (Habitaciones Cercanas)'),
+                      child: Text('⚡ 5 GHz (Alta Velocidad / Cercano)', overflow: TextOverflow.ellipsis),
                     ),
                   ],
                   onChanged: (val) {
                     if (val != null) setState(() => _selectedBackhaulBand = val);
                   },
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _selectedBackhaulBand.contains('5')
+                      ? 'Recomendado si están en la misma habitación o sin muros densos.'
+                      : 'Recomendado para atravesar paredes de concreto y pisos con estabilidad.',
+                  style: const TextStyle(fontSize: 11, color: Colors.white54),
                 ),
               ],
             ),
@@ -2445,40 +2455,41 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        // Header de acción
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        // Header de acción responsivo
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('Satélites Mesh Activos', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
-                Text('Monitoreo en vivo y control individual de nodos', style: TextStyle(fontSize: 11, color: Colors.grey)),
-              ],
-            ),
+            const Text('Satélites Mesh Activos', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
+            const SizedBox(height: 2),
+            const Text('Monitoreo en vivo y control individual de nodos', style: TextStyle(fontSize: 11, color: Colors.grey)),
+            const SizedBox(height: 12),
             Row(
               children: [
-                ElevatedButton.icon(
-                  onPressed: _isDiscoveringSatellites ? null : _autoDiscoverSatellites,
-                  icon: _isDiscoveringSatellites
-                      ? const SizedBox(height: 14, width: 14, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                      : const Icon(Icons.radar, size: 16),
-                  label: const Text('Detectar IP', style: TextStyle(fontSize: 11)),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF0284C7),
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _isDiscoveringSatellites ? null : _autoDiscoverSatellites,
+                    icon: _isDiscoveringSatellites
+                        ? const SizedBox(height: 14, width: 14, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                        : const Icon(Icons.radar, size: 16),
+                    label: const Text('Detectar IP', style: TextStyle(fontSize: 11)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF0284C7),
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    ),
                   ),
                 ),
                 const SizedBox(width: 8),
-                ElevatedButton.icon(
-                  onPressed: _isCheckingAllNodes ? null : _checkAllNodes,
-                  icon: _isCheckingAllNodes
-                      ? const SizedBox(height: 14, width: 14, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                      : const Icon(Icons.refresh, size: 16),
-                  label: const Text('Comprobar', style: TextStyle(fontSize: 11)),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF2563EB),
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _isCheckingAllNodes ? null : _checkAllNodes,
+                    icon: _isCheckingAllNodes
+                        ? const SizedBox(height: 14, width: 14, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                        : const Icon(Icons.refresh, size: 16),
+                    label: const Text('Comprobar', style: TextStyle(fontSize: 11)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF2563EB),
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    ),
                   ),
                 ),
               ],
