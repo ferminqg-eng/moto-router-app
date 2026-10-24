@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
@@ -51,7 +52,7 @@ class MeshNode {
     required this.ip,
     this.mac = '',
     this.password = '',
-    this.backhaulBand = '2.4 GHz',
+    this.backhaulBand = '5 GHz',
     this.txPower = 23,
     this.quality,
     this.isChecking = false,
@@ -71,7 +72,7 @@ class MeshNode {
     ip: json['ip'] ?? '192.168.1.2',
     mac: json['mac'] ?? '',
     password: json['password'] ?? '',
-    backhaulBand: json['backhaulBand'] ?? '2.4 GHz',
+    backhaulBand: json['backhaulBand'] ?? '5 GHz',
     txPower: json['txPower'] ?? 23,
   );
 }
@@ -128,7 +129,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   final TextEditingController _addSatNameController = TextEditingController(text: 'Satélite 1');
   final TextEditingController _addSatPassController = TextEditingController();
   bool _addSatPassObscure = true;
-  String _selectedBackhaulBand = '2.4 GHz';
+  String _selectedBackhaulBand = '5 GHz';
   String _calculatedNextIp = '192.168.1.2';
   bool _isCalculatingIp = false;
   bool _isProvisioningSat = false;
@@ -1609,6 +1610,49 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     }
   }
 
+  void _showExitAppDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.power_settings_new, color: Colors.redAccent, size: 24),
+            SizedBox(width: 8),
+            Text('¿Qué deseas hacer?', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+          ],
+        ),
+        content: const Text(
+          'Puedes cerrar la sesión actual para volver a la pantalla de login o salir y cerrar la aplicación completamente.',
+          style: TextStyle(color: Colors.white70, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancelar', style: TextStyle(color: Colors.grey)),
+          ),
+          OutlinedButton(
+            style: OutlinedButton.styleFrom(side: const BorderSide(color: Color(0xFF38BDF8))),
+            onPressed: () {
+              Navigator.pop(ctx);
+              setState(() => _isConnected = false);
+            },
+            child: const Text('Cerrar Sesión', style: TextStyle(color: Color(0xFF38BDF8))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () {
+              Navigator.pop(ctx);
+              SystemNavigator.pop();
+            },
+            child: const Text('Salir de la App', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_isConnected) {
@@ -1740,9 +1784,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
             onPressed: _showDiagnosticDialog,
           ),
           IconButton(
-            tooltip: 'Cerrar Sesión',
-            icon: const Icon(Icons.logout, color: Colors.white70),
-            onPressed: () => setState(() => _isConnected = false),
+            tooltip: 'Salir',
+            icon: const Icon(Icons.power_settings_new, color: Colors.white70),
+            onPressed: _showExitAppDialog,
           ),
         ],
       ),
@@ -2471,11 +2515,13 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     onPressed: _isDiscoveringSatellites ? null : _autoDiscoverSatellites,
                     icon: _isDiscoveringSatellites
                         ? const SizedBox(height: 14, width: 14, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                        : const Icon(Icons.radar, size: 16),
-                    label: const Text('Detectar IP', style: TextStyle(fontSize: 11)),
+                        : const Icon(Icons.radar, size: 16, color: Colors.white),
+                    label: const Text('Detectar IP', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF0284C7),
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                     ),
                   ),
                 ),
@@ -2485,11 +2531,13 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     onPressed: _isCheckingAllNodes ? null : _checkAllNodes,
                     icon: _isCheckingAllNodes
                         ? const SizedBox(height: 14, width: 14, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                        : const Icon(Icons.refresh, size: 16),
-                    label: const Text('Comprobar', style: TextStyle(fontSize: 11)),
+                        : const Icon(Icons.refresh, size: 16, color: Colors.white),
+                    label: const Text('Comprobar', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF2563EB),
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                     ),
                   ),
                 ),
@@ -2701,52 +2749,68 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               const SizedBox(height: 14),
             ],
 
-            // Controles Individuales: Potencia de Transmisión & Reinicio
+            // Controles Individuales: Potencia de Transmisión
+            DropdownButtonFormField<int>(
+              value: node.txPower,
+              dropdownColor: const Color(0xFF1E293B),
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+              decoration: const InputDecoration(
+                labelText: 'Potencia Satélite',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              items: const [
+                DropdownMenuItem(value: 23, child: Text('⚡ 23 dBm (100% Máx)')),
+                DropdownMenuItem(value: 20, child: Text('🟢 20 dBm (75%)')),
+                DropdownMenuItem(value: 17, child: Text('🟡 17 dBm (50%)')),
+                DropdownMenuItem(value: 14, child: Text('🔵 14 dBm (25%)')),
+              ],
+              onChanged: (p) {
+                if (p != null) _setNodeTxPower(node, p);
+              },
+            ),
+            const SizedBox(height: 10),
+            // Botones con texto y etiquetas legibles
             Row(
               children: [
                 Expanded(
-                  child: DropdownButtonFormField<int>(
-                    value: node.txPower,
-                    dropdownColor: const Color(0xFF1E293B),
-                    style: const TextStyle(color: Colors.white, fontSize: 12),
-                    decoration: const InputDecoration(
-                      labelText: 'Potencia Satélite',
-                      border: OutlineInputBorder(),
-                      isDense: true,
+                  child: ElevatedButton.icon(
+                    onPressed: node.isChecking ? null : () => _checkNodeQuality(node),
+                    icon: node.isChecking
+                        ? const SizedBox(height: 14, width: 14, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                        : const Icon(Icons.network_check, size: 16, color: Colors.white),
+                    label: const Text('Comprobar', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF2563EB),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                     ),
-                    items: const [
-                      DropdownMenuItem(value: 23, child: Text('⚡ 23 dBm (100% Máx)')),
-                      DropdownMenuItem(value: 20, child: Text('🟢 20 dBm (75%)')),
-                      DropdownMenuItem(value: 17, child: Text('🟡 17 dBm (50%)')),
-                      DropdownMenuItem(value: 14, child: Text('🔵 14 dBm (25%)')),
-                    ],
-                    onChanged: (p) {
-                      if (p != null) _setNodeTxPower(node, p);
-                    },
                   ),
                 ),
-                const SizedBox(width: 10),
-                IconButton.filled(
-                  tooltip: 'Comprobar Enlace',
-                  style: IconButton.styleFrom(backgroundColor: const Color(0xFF2563EB)),
-                  onPressed: node.isChecking ? null : () => _checkNodeQuality(node),
-                  icon: node.isChecking
-                      ? const SizedBox(height: 16, width: 16, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                      : const Icon(Icons.network_check, size: 20),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () => _rebootNode(node),
+                    icon: const Icon(Icons.restart_alt, size: 16, color: Colors.white),
+                    label: const Text('Reiniciar', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFDC2626),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                  ),
                 ),
-                const SizedBox(width: 6),
-                IconButton.filled(
-                  tooltip: 'Reiniciar Satélite',
-                  style: IconButton.styleFrom(backgroundColor: Colors.redAccent.withOpacity(0.8)),
-                  onPressed: () => _rebootNode(node),
-                  icon: const Icon(Icons.restart_alt, size: 20),
-                ),
-                const SizedBox(width: 6),
-                IconButton.filled(
+                const SizedBox(width: 8),
+                IconButton(
                   tooltip: 'Eliminar Satélite',
-                  style: IconButton.styleFrom(backgroundColor: Colors.red.shade900),
+                  style: IconButton.styleFrom(
+                    backgroundColor: Colors.red.shade900.withOpacity(0.4),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
                   onPressed: () => _removeSatellite(node),
-                  icon: const Icon(Icons.delete_outline, size: 20),
+                  icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 20),
                 ),
               ],
             ),
