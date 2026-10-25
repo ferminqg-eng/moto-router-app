@@ -52,7 +52,7 @@ class MeshNode {
     required this.ip,
     this.mac = '',
     this.password = '',
-    this.backhaulBand = '5 GHz',
+    this.backhaulBand = '2.4 GHz',
     this.txPower = 23,
     this.quality,
     this.isChecking = false,
@@ -72,7 +72,7 @@ class MeshNode {
     ip: json['ip'] ?? '192.168.1.2',
     mac: json['mac'] ?? '',
     password: json['password'] ?? '',
-    backhaulBand: json['backhaulBand'] ?? '5 GHz',
+    backhaulBand: json['backhaulBand'] ?? '2.4 GHz',
     txPower: json['txPower'] ?? 23,
   );
 }
@@ -108,7 +108,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   final TextEditingController _key5Controller = TextEditingController();
   String _enc5 = 'psk2';
 
-  int _txPower = 23; // 23 = Max (100%), 20 = Alta (75%), 17 = Media (50%), 14 = Baja (25%)
+  int _txPower = 23;
+  int _channel24 = 0;
+  int _channel5 = 0; // 23 = Max (100%), 20 = Alta (75%), 17 = Media (50%), 14 = Baja (25%)
   bool _legacyMode = false; // Compatibilidad con clientes sin Wi-Fi 6 en 2.4 GHz
   bool _isPassObscure = true;
 
@@ -129,7 +131,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   final TextEditingController _addSatNameController = TextEditingController(text: 'Satélite 1');
   final TextEditingController _addSatPassController = TextEditingController();
   bool _addSatPassObscure = true;
-  String _selectedBackhaulBand = '5 GHz';
+  String _selectedBackhaulBand = '2.4 GHz';
   String _calculatedNextIp = '192.168.1.2';
   bool _isCalculatingIp = false;
   bool _isProvisioningSat = false;
@@ -504,6 +506,8 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         enc5: _separateBands ? _enc5 : _enc24,
         txPower: _txPower,
         legacyMode: _legacyMode,
+        channel24: _mainChannel24,
+        channel5: _mainChannel5,
       );
 
       await RouterService.saveWifiConfig(_currentIp, _currentPassword, cfg);
@@ -759,8 +763,14 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         await RouterService.prepareMainRouterForWds(_currentIp, _currentPassword);
       } catch (_) {}
 
+      String targetSatGateway = '192.168.1.1';
+      try {
+        final detected = await RouterService.detectSatelliteGateway();
+        if (detected.isNotEmpty) targetSatGateway = detected;
+      } catch (_) {}
+
       final satMac = await RouterService.provisionSatelliteDirect(
-        satIp: '192.168.1.1',
+        satIp: targetSatGateway,
         satPassword: satPass,
         targetIp: targetIp,
         mainGateway: _currentIp,
@@ -2053,6 +2063,72 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   onChanged: (val) => setState(() => _legacyMode = val),
                 ),
 
+                const SizedBox(height: 14),
+                // Canales de Transmisión Wi-Fi (Auto / Manual)
+                const Text('Canales de Transmisión Wi-Fi', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF38BDF8))),
+                const SizedBox(height: 4),
+                const Text('Elige "Auto" para que el router seleccione el canal óptimo dinámicamente, o fija un canal manual.', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: DropdownButtonFormField<int>(
+                        value: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].contains(_mainChannel24) ? _mainChannel24 : 0,
+                        dropdownColor: const Color(0xFF1E293B),
+                        style: const TextStyle(color: Colors.white, fontSize: 13),
+                        decoration: const InputDecoration(
+                          labelText: 'Canal 2.4 GHz',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        items: const [
+                          DropdownMenuItem(value: 0, child: Text('Auto (Recomendado)')),
+                          DropdownMenuItem(value: 1, child: Text('Canal 1 (2412 MHz)')),
+                          DropdownMenuItem(value: 2, child: Text('Canal 2 (2417 MHz)')),
+                          DropdownMenuItem(value: 3, child: Text('Canal 3 (2422 MHz)')),
+                          DropdownMenuItem(value: 4, child: Text('Canal 4 (2427 MHz)')),
+                          DropdownMenuItem(value: 5, child: Text('Canal 5 (2432 MHz)')),
+                          DropdownMenuItem(value: 6, child: Text('Canal 6 (2437 MHz)')),
+                          DropdownMenuItem(value: 7, child: Text('Canal 7 (2442 MHz)')),
+                          DropdownMenuItem(value: 8, child: Text('Canal 8 (2447 MHz)')),
+                          DropdownMenuItem(value: 9, child: Text('Canal 9 (2452 MHz)')),
+                          DropdownMenuItem(value: 10, child: Text('Canal 10 (2457 MHz)')),
+                          DropdownMenuItem(value: 11, child: Text('Canal 11 (2462 MHz)')),
+                        ],
+                        onChanged: (val) {
+                          if (val != null) setState(() => _mainChannel24 = val);
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: DropdownButtonFormField<int>(
+                        value: [0, 36, 40, 44, 48, 149, 153, 157, 161].contains(_mainChannel5) ? _mainChannel5 : 0,
+                        dropdownColor: const Color(0xFF1E293B),
+                        style: const TextStyle(color: Colors.white, fontSize: 13),
+                        decoration: const InputDecoration(
+                          labelText: 'Canal 5 GHz',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        items: const [
+                          DropdownMenuItem(value: 0, child: Text('Auto (Recomendado)')),
+                          DropdownMenuItem(value: 36, child: Text('Canal 36 (5180 MHz)')),
+                          DropdownMenuItem(value: 40, child: Text('Canal 40 (5200 MHz)')),
+                          DropdownMenuItem(value: 44, child: Text('Canal 44 (5220 MHz)')),
+                          DropdownMenuItem(value: 48, child: Text('Canal 48 (5240 MHz)')),
+                          DropdownMenuItem(value: 149, child: Text('Canal 149 (5745 MHz)')),
+                          DropdownMenuItem(value: 153, child: Text('Canal 153 (5765 MHz)')),
+                          DropdownMenuItem(value: 157, child: Text('Canal 157 (5785 MHz)')),
+                          DropdownMenuItem(value: 161, child: Text('Canal 161 (5805 MHz)')),
+                        ],
+                        onChanged: (val) {
+                          if (val != null) setState(() => _mainChannel5 = val);
+                        },
+                      ),
+                    ),
+                  ],
+                ),
                 const SizedBox(height: 20),
                 ElevatedButton.icon(
                   onPressed: _isLoading ? null : _saveWifi,
