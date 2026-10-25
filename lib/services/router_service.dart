@@ -166,6 +166,27 @@ class CableSatelliteCandidate {
 class RouterService {
   /// Desbloquea y arranca LuCI y SSH directamente desde la app mediante POST con contraseña,
   /// preservando las cookies de sesión (sysauth / sysauth_https) y verificando el puerto 22
+  /// Detecta automáticamente si el satélite responde en 10.10.11.1 (cable WAN conectado) o 192.168.1.1 (Wi-Fi de fábrica)
+  static Future<String> detectSatelliteGateway() async {
+    for (final testIp in ['10.10.11.1', '192.168.1.1']) {
+      try {
+        final client = HttpClient()
+          ..badCertificateCallback = (X509Certificate cert, String host, int port) => true;
+        final req = await client.getUrl(Uri.parse('https://$testIp/cgi-bin/luci/admin/minim/enable_admin')).timeout(const Duration(milliseconds: 1500));
+        final res = await req.close();
+        await res.drain();
+        return testIp;
+      } catch (_) {
+        try {
+          final sock = await Socket.connect(testIp, 80, timeout: const Duration(milliseconds: 1200));
+          sock.destroy();
+          return testIp;
+        } catch (_) {}
+      }
+    }
+    return '192.168.1.1';
+  }
+
   static Future<bool> unlockRouter(String ip, String password) async {
     final client = HttpClient()
       ..badCertificateCallback = (X509Certificate cert, String host, int port) => true;
@@ -583,6 +604,25 @@ class RouterService {
       wl -i wl0 lazywds 1 2>/dev/null || true
       wl -i wl1 lazywds 1 2>/dev/null || true
     ''');
+
+    // 3.5 Guardar Canales Wi-Fi en UCI y NVRAM
+    if (cfg.channel24 == 0) {
+      commands.add("uci -q set wireless.radio0.channel='auto'");
+      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl0_channel='0' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
+    } else {
+      commands.add("uci -q set wireless.radio0.channel='${cfg.channel24}'");
+      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl0_channel='${cfg.channel24}' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
+      commands.add("wl -i wl0 channel ${cfg.channel24} 2>/dev/null || true");
+    }
+
+    if (cfg.channel5 == 0) {
+      commands.add("uci -q set wireless.radio1.channel='auto'");
+      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl1_channel='0' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
+    } else {
+      commands.add("uci -q set wireless.radio1.channel='${cfg.channel5}'");
+      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl1_channel='${cfg.channel5}' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
+      commands.add("wl -i wl1 channel ${cfg.channel5} 2>/dev/null || true");
+    }
 
     // 4. Ajustar potencia y modo legacy en OpenWrt UCI
     commands.add("uci -q set wireless.radio0.txpower='${cfg.txPower}'");
@@ -1443,16 +1483,26 @@ EOF
     required String mainSsid,
     required String mainKey,
     String satName = 'Equipo Satélite',
-    int channel5 = 36,
+    int channel5 = 149,
     int channel24 = 6,
     String mainBssid = '',
-    String backhaulBand = '5 GHz',
+    String backhaulBand = '2.4 GHz',
     void Function(String step, double progress)? onProgress,
   }) async {
-    onProgress?.call('Conectando a LuCI en $satIp y arrancando Dropbear SSH...', 0.20);
-    final unlocked = await unlockRouter(satIp, satPassword);
+    // 1. Detección automática de IP del satélite (10.10.11.1 si tiene cable conectado, o 192.168.1.1)
+    String effectiveSatIp = satIp;
+    onProgress?.call('Localizando satélite en la red...', 0.15);
+    try {
+      final detectedIp = await detectSatelliteGateway();
+      if (detectedIp.isNotEmpty) {
+        effectiveSatIp = detectedIp;
+      }
+    } catch (_) {}
+
+    onProgress?.call('Conectando a LuCI en $effectiveSatIp y arrancando SSH...', 0.25);
+    final unlocked = await unlockRouter(effectiveSatIp, satPassword);
     if (!unlocked) {
-      throw Exception('No se pudo desbloquear el satélite en $satIp. Verifica que tu teléfono esté conectado a la red Wi-Fi de fábrica de ese satélite y que la contraseña de etiqueta sea correcta.');
+      throw Exception('No se pudo desbloquear el satélite en $effectiveSatIp. Verifica que tu teléfono esté conectado a la red Wi-Fi de fábrica de ese satélite y que la contraseña de etiqueta sea correcta.');
     }
     
     onProgress?.call('Verificando acceso SSH en puerto 22...', 0.40);
@@ -1460,7 +1510,7 @@ EOF
 
     String satMac = '';
     try {
-      final macOut = await executeSSH(satIp, satPassword, "cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/net/br-lan/address 2>/dev/null || wl -i wl0 cur_etheraddr 2>/dev/null || echo ''");
+      final macOut = await executeSSH(effectiveSatIp, satPassword, "cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/net/br-lan/address 2>/dev/null || wl -i wl0 cur_etheraddr 2>/dev/null || echo ''");
       final match = RegExp(r'([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})').firstMatch(macOut);
       if (match != null) satMac = match.group(0)!.toUpperCase();
     } catch (_) {}
@@ -1468,7 +1518,12 @@ EOF
     final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
     final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
 
-    onProgress?.call('Configurando Broadcom Mesh Backhaul (wl1.5 5GHz 4-Address), canales e IP $targetIp...', 0.65);
+    final is24G = backhaulBand.contains('2.4');
+    final bhIface = is24G ? 'wl0.5' : 'wl1.5';
+    final bhPhy = is24G ? 'phy0' : 'phy1';
+    final bhDesc = is24G ? '2.4 GHz (Mayor Alcance)' : '5 GHz (Alta Velocidad)';
+
+    onProgress?.call('Configurando Broadcom Mesh Backhaul ($bhIface $bhDesc), puente Capa 2 e IP $targetIp...', 0.65);
 
     final script = '''
       # 1. Neutralizar completamente el agente de nube unum/minim
@@ -1501,11 +1556,7 @@ EOF
       echo '$cleanHost' > /proc/sys/kernel/hostname
       uci commit system
 
-      # 5. Canales Wi-Fi: Sincronizar con el Router Principal
-      uci -q set wireless.radio0.channel='$channel24'
-      uci -q set wireless.radio1.channel='$channel5'
-
-      # 6. Configurar radios como Access Points locales (mismo SSID y clave)
+      # 5. Configurar radios como Access Points locales (mismo SSID y clave para Roaming)
       uci -q delete wireless.mesh_sta
       for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
         ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
@@ -1517,24 +1568,7 @@ EOF
       done
       uci commit wireless
 
-      # 7. Persistir modo repetidor en NVRAM
-      if which nvram >/dev/null 2>&1; then
-        nvram set router_name='$cleanHost'
-        nvram set multiap_mode='2'
-        ${mainSsid.isNotEmpty ? "nvram set wl0_ssid='$mainSsid'" : ""}
-        ${mainSsid.isNotEmpty ? "nvram set wl1_ssid='$mainSsid'" : ""}
-        ${mainSsid.isNotEmpty ? "nvram set wl_ssid='$mainSsid'" : ""}
-        ${mainKey.isNotEmpty ? "nvram set wl0_wpa_psk='$mainKey'" : ""}
-        ${mainKey.isNotEmpty ? "nvram set wl1_wpa_psk='$mainKey'" : ""}
-        ${mainKey.isNotEmpty ? "nvram set wl_wpa_psk='$mainKey'" : ""}
-        nvram set wl0_akm='psk2'
-        nvram set wl1_akm='psk2'
-        nvram set wl0_channel='$channel24'
-        nvram set wl1_channel='$channel5'
-        nvram commit 2>/dev/null || true
-      fi
-
-      # 8. Modo Switch Universal: unificar WAN (eth0) y LAN (eth1) en br-lan con IP fija
+      # 6. Modo Switch Universal: unificar WAN (eth0) y LAN (eth1) en br-lan con IP fija
       uci -q delete network.wan
       uci -q delete network.wan6
       uci -q set network.lan.ifname='eth0 eth1'
@@ -1548,7 +1582,7 @@ EOF
       uci -q set network.lan.stp='0'
       uci commit network
 
-      # 9. Apagar Servidor DHCP y Firewall (Puente Capa 2 transparente sin interferencias)
+      # 7. Apagar Servidor DHCP y Firewall local (Puente Capa 2 transparente sin interferencias)
       uci set dhcp.lan.ignore='1'
       uci commit dhcp
       /etc/init.d/dnsmasq stop 2>/dev/null || true
@@ -1556,11 +1590,11 @@ EOF
       /etc/init.d/firewall stop 2>/dev/null || true
       /etc/init.d/firewall disable 2>/dev/null || true
 
-      # 10. Habilitar Reenvío de Paquetes y Bypass de Firewall en Puente
+      # 8. Habilitar Reenvío de Paquetes y Bypass de Firewall en Puente
       sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
       sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
 
-      # 11. Generar archivo de configuración wpa_supplicant para el enlace Mesh
+      # 9. Generar archivo de configuración wpa_supplicant para el enlace Mesh
       cat << 'EOFSUPP' > /etc/mesh_supp.conf
 update_config=1
 ctrl_interface=/var/run/wpa_supplicant
@@ -1576,21 +1610,24 @@ network={
 EOFSUPP
       chmod 600 /etc/mesh_supp.conf
 
-      # 12. Script de conexión Mesh Backhaul nativo en wl1.5 (/usr/bin/start_mesh_backhaul.sh)
+      # 10. Script de arranque de retorno Mesh ($bhIface en $bhPhy)
       cat << 'EOFSTA' > /usr/bin/start_mesh_backhaul.sh
 #!/bin/sh
-killall -9 wpa_supplicant 2>/dev/null
+killall -9 wpa_supplicant 2>/dev/null || true
 sleep 1
-ifconfig wl1.5 down 2>/dev/null
-iw dev wl1.5 set 4addr on 2>/dev/null || true
-ifconfig wl1.5 up 2>/dev/null
-wpa_supplicant -i wl1.5 -Dnl80211 -c /etc/mesh_supp.conf -b br-lan -B
-sleep 2
-brctl addif br-lan wl1.5 2>/dev/null || true
+ifconfig $bhIface down 2>/dev/null || true
+iw dev $bhIface del 2>/dev/null || true
+sleep 1
+iw phy $bhPhy interface add $bhIface type managed 2>/dev/null || true
+iw dev $bhIface set 4addr on 2>/dev/null || true
+ifconfig $bhIface up 2>/dev/null || true
+wpa_supplicant -i $bhIface -Dnl80211 -c /etc/mesh_supp.conf -b br-lan -B
+sleep 3
+brctl addif br-lan $bhIface 2>/dev/null || true
 EOFSTA
       chmod +x /usr/bin/start_mesh_backhaul.sh
 
-      # 13. Script /etc/rc.local (Inicia SSH y enlace Mesh en cada encendido)
+      # 11. Script /etc/rc.local (Inicia SSH y enlace Mesh en cada encendido)
       cat << 'EOFRC' > /etc/rc.local
 sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
 sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
@@ -1601,20 +1638,20 @@ exit 0
 EOFRC
       chmod +x /etc/rc.local 2>/dev/null || true
 
-      # 14. Servicio Mesh Watchdog permanente
+      # 12. Servicio Mesh Watchdog permanente
       cat << 'EOFWD' > /etc/init.d/mesh_watchdog
 #!/bin/sh /etc/rc.common
 START=99
 start() {
   (
-    sleep 5
+    sleep 8
     /usr/bin/start_mesh_backhaul.sh
     while true; do
       sleep 12
+      brctl addif br-lan $bhIface 2>/dev/null || true
       if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
         /usr/bin/start_mesh_backhaul.sh
       fi
-      brctl addif br-lan wl1.5 2>/dev/null || true
     done
   ) &
 }
@@ -1622,7 +1659,7 @@ EOFWD
       chmod +x /etc/init.d/mesh_watchdog 2>/dev/null || true
       /etc/init.d/mesh_watchdog enable 2>/dev/null || true
 
-      # 15. Flush y reinicio
+      # 13. Flush y reinicio
       killall -9 udhcpc 2>/dev/null || true
       sync
       sync
@@ -1630,7 +1667,7 @@ EOFWD
     ''';
 
     try {
-      await executeSSH(satIp, satPassword, script);
+      await executeSSH(effectiveSatIp, satPassword, script);
     } catch (e) {
       final err = e.toString().toLowerCase();
       if (!err.contains('closed') && !err.contains('reset') && !err.contains('broken pipe') && !err.contains('socketexception')) {
