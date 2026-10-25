@@ -259,20 +259,20 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       setState(() {
         _separateBands = wifi.separateBands;
         if (wifi.ssid24.isNotEmpty) {
-          _ssid24Controller.text = wifi.ssid24;
-          if (_addSatMainSsidController.text.isEmpty || _addSatMainSsidController.text == 'Motorolamesh') {
-            _addSatMainSsidController.text = wifi.ssid24;
-          }
+          final cleanS = wifi.ssid24.replaceAll('Current SSID:', '').replaceAll('"', '').trim();
+          _ssid24Controller.text = cleanS;
+          _addSatMainSsidController.text = cleanS;
         }
         if (wifi.key24.isNotEmpty) {
-          _key24Controller.text = wifi.key24;
-          if (_addSatMainKeyController.text.isEmpty) {
-            _addSatMainKeyController.text = wifi.key24;
-          }
+          _key24Controller.text = wifi.key24.trim();
+          _addSatMainKeyController.text = wifi.key24.trim();
         }
         _enc24 = wifi.enc24.isNotEmpty ? wifi.enc24 : 'psk2';
 
-        if (wifi.ssid5.isNotEmpty) _ssid5Controller.text = wifi.ssid5;
+        if (wifi.ssid5.isNotEmpty) {
+          final clean5 = wifi.ssid5.replaceAll('Current SSID:', '').replaceAll('"', '').trim();
+          _ssid5Controller.text = clean5;
+        }
         if (wifi.key5.isNotEmpty) _key5Controller.text = wifi.key5;
         _enc5 = wifi.enc5.isNotEmpty ? wifi.enc5 : 'psk2';
 
@@ -690,12 +690,17 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     final satName = _addSatNameController.text.trim().isNotEmpty
         ? _addSatNameController.text.trim()
         : 'Satélite 1';
-    final mainSsid = _addSatMainSsidController.text.trim().isNotEmpty
-        ? _addSatMainSsidController.text.trim()
-        : (_ssid24Controller.text.trim().isNotEmpty ? _ssid24Controller.text.trim() : 'Motorolamesh');
-    final mainKey = _addSatMainKeyController.text.trim().isNotEmpty
-        ? _addSatMainKeyController.text.trim()
-        : _key24Controller.text.trim();
+    String mainSsid = _addSatMainSsidController.text.trim();
+    if (mainSsid.isEmpty || mainSsid == 'Motorolamesh') {
+      mainSsid = _ssid24Controller.text.trim();
+    }
+    mainSsid = mainSsid.replaceAll('Current SSID:', '').replaceAll('"', '').trim();
+    if (mainSsid.isEmpty) mainSsid = 'MotorolaQP';
+
+    String mainKey = _addSatMainKeyController.text.trim();
+    if (mainKey.isEmpty) {
+      mainKey = _key24Controller.text.trim();
+    }
     final targetIp = _calculatedNextIp;
 
     double progressVal = 0.15;
