@@ -449,8 +449,8 @@ class RouterService {
   /// Lee la configuración Wi-Fi actual del router, incluyendo potencia, cifrado, canales y BSSID
   static Future<WifiConfigData> getWifiConfig(String ip, String password) async {
     const script = '''
-      echo "===SSID0===" && (wl -i wl0 ssid 2>/dev/null | tr -d '"' || nvram get wl0_ssid || uci -q get wireless.default_wl0.ssid || echo "")
-      echo "===SSID1===" && (wl -i wl1 ssid 2>/dev/null | tr -d '"' || nvram get wl1_ssid || uci -q get wireless.default_wl1.ssid || echo "")
+      echo "===SSID0===" && (nvram get wl0_ssid 2>/dev/null || uci -q get wireless.default_wl0.ssid || wl -i wl0 ssid 2>/dev/null | sed 's/Current SSID: //g' | tr -d '"' || echo "")
+      echo "===SSID1===" && (nvram get wl1_ssid 2>/dev/null || uci -q get wireless.default_wl1.ssid || wl -i wl1 ssid 2>/dev/null | sed 's/Current SSID: //g' | tr -d '"' || echo "")
       echo "===KEY0===" && (nvram get wl0_wpa_psk || uci -q get wireless.default_wl0.key || echo "")
       echo "===KEY1===" && (nvram get wl1_wpa_psk || uci -q get wireless.default_wl1.key || echo "")
       echo "===TXPOWER===" && uci -q get wireless.radio0.txpower || echo "23"
@@ -470,8 +470,8 @@ class RouterService {
     for (int i = 1; i < parts.length; i += 2) {
       final tag = parts[i].trim();
       final val = i + 1 < parts.length ? parts[i + 1].trim() : '';
-      if (tag == 'SSID0' && val.isNotEmpty && !val.toLowerCase().contains('guest')) config.ssid24 = val;
-      if (tag == 'SSID1' && val.isNotEmpty && !val.toLowerCase().contains('guest')) config.ssid5 = val;
+      if (tag == 'SSID0' && val.isNotEmpty && !val.toLowerCase().contains('guest')) config.ssid24 = val.replaceAll('Current SSID:', '').replaceAll('"', '').trim();
+      if (tag == 'SSID1' && val.isNotEmpty && !val.toLowerCase().contains('guest')) config.ssid5 = val.replaceAll('Current SSID:', '').replaceAll('"', '').trim();
       if (tag == 'KEY0' && val.isNotEmpty) config.key24 = val;
       if (tag == 'KEY1' && val.isNotEmpty) config.key5 = val;
       if (tag == 'WIRELESS') wirelessOutput = val;
@@ -519,11 +519,13 @@ class RouterService {
       if (ssid.toLowerCase().contains('guest')) continue;
 
       if (dev.contains('5') || dev.contains('1') || dev.toLowerCase().contains('wlan1') || dev.contains('radio1')) {
-        if (config.ssid5.isEmpty) config.ssid5 = ssid;
+        final cleanS = ssid.replaceAll('Current SSID:', '').replaceAll('"', '').trim();
+        if (config.ssid5.isEmpty) config.ssid5 = cleanS;
         if (config.key5.isEmpty) config.key5 = key;
         config.enc5 = enc;
       } else {
-        if (config.ssid24.isEmpty) config.ssid24 = ssid;
+        final cleanS = ssid.replaceAll('Current SSID:', '').replaceAll('"', '').trim();
+        if (config.ssid24.isEmpty) config.ssid24 = cleanS;
         if (config.key24.isEmpty) config.key24 = key;
         config.enc24 = enc;
       }
@@ -1517,6 +1519,8 @@ EOF
 
     final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
     final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
+    final cleanMainSsid = mainSsid.replaceAll('Current SSID:', '').replaceAll('"', '').trim();
+    final cleanMainKey = mainKey.replaceAll('"', '').trim();
 
     final is24G = backhaulBand.contains('2.4');
     final bhIface = is24G ? 'wl0.5' : 'wl1.5';
@@ -1551,16 +1555,35 @@ EOF
       /etc/init.d/uhttpd enable 2>/dev/null || true
       /etc/init.d/uhttpd start 2>/dev/null || true
 
-      # 4. Hostname del Satélite
+      # 4. Hostname del Satélite y Clonación en NVRAM de Broadcom
       uci set system.@system[0].hostname='$cleanHost'
       echo '$cleanHost' > /proc/sys/kernel/hostname
       uci commit system
 
+      if which nvram >/dev/null 2>&1; then
+        nvram set router_name='$cleanHost'
+        nvram set wl0_ssid='$cleanMainSsid'
+        nvram set wl1_ssid='$cleanMainSsid'
+        nvram set wl_ssid='$cleanMainSsid'
+        ${cleanMainKey.isNotEmpty ? "nvram set wl0_wpa_psk='$cleanMainKey'" : ""}
+        ${cleanMainKey.isNotEmpty ? "nvram set wl1_wpa_psk='$cleanMainKey'" : ""}
+        ${cleanMainKey.isNotEmpty ? "nvram set wl_wpa_psk='$cleanMainKey'" : ""}
+        nvram set wl0_akm='psk2'
+        nvram set wl1_akm='psk2'
+        nvram set wl0_lazywds='1'
+        nvram set wl1_lazywds='1'
+        nvram commit 2>/dev/null || true
+      fi
+      wl -i wl0 ssid '$cleanMainSsid' 2>/dev/null || true
+      wl -i wl1 ssid '$cleanMainSsid' 2>/dev/null || true
+      ${cleanMainKey.isNotEmpty ? "wl -i wl0 wpa_psk '$cleanMainKey' 2>/dev/null || true" : ""}
+      ${cleanMainKey.isNotEmpty ? "wl -i wl1 wpa_psk '$cleanMainKey' 2>/dev/null || true" : ""}
+
       # 5. Configurar radios como Access Points locales (mismo SSID y clave para Roaming)
       uci -q delete wireless.mesh_sta
       for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
-        ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
-        ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
+        ${cleanMainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$cleanMainSsid'" : ""}
+        ${cleanMainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$cleanMainKey'" : ""}
         uci set wireless.\${iface}.encryption='psk2'
         uci set wireless.\${iface}.mode='ap'
         uci set wireless.\${iface}.network='lan'
@@ -1599,13 +1622,13 @@ EOF
 update_config=1
 ctrl_interface=/var/run/wpa_supplicant
 network={
-    ssid="$mainSsid"
+    ssid="$cleanMainSsid"
     scan_ssid=1
     proto=RSN
     key_mgmt=WPA-PSK
     pairwise=CCMP
     group=CCMP
-    psk="$mainKey"
+    psk="$cleanMainKey"
 }
 EOFSUPP
       chmod 600 /etc/mesh_supp.conf
@@ -1619,7 +1642,6 @@ ifconfig $bhIface down 2>/dev/null || true
 iw dev $bhIface del 2>/dev/null || true
 sleep 1
 iw phy $bhPhy interface add $bhIface type managed 2>/dev/null || true
-iw dev $bhIface set 4addr on 2>/dev/null || true
 ifconfig $bhIface up 2>/dev/null || true
 wpa_supplicant -i $bhIface -Dnl80211 -c /etc/mesh_supp.conf -b br-lan -B
 sleep 3
@@ -1627,24 +1649,14 @@ brctl addif br-lan $bhIface 2>/dev/null || true
 EOFSTA
       chmod +x /usr/bin/start_mesh_backhaul.sh
 
-      # 11. Script /etc/rc.local (Inicia SSH y enlace Mesh en cada encendido)
-      cat << 'EOFRC' > /etc/rc.local
-sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
-sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
-/etc/init.d/firewall stop 2>/dev/null || true
-/usr/sbin/dropbear -p 22 -B 2>/dev/null || /etc/init.d/dropbear start 2>/dev/null || true
-/usr/bin/start_mesh_backhaul.sh 2>/dev/null &
-exit 0
-EOFRC
-      chmod +x /etc/rc.local 2>/dev/null || true
-
-      # 12. Servicio Mesh Watchdog permanente
-      cat << 'EOFWD' > /etc/init.d/mesh_watchdog
+      # 11. Servicio de Inicio Mesh Backhaul y Dropbear en /etc/init.d
+      cat << 'EOFINIT' > /etc/init.d/mesh_backhaul
 #!/bin/sh /etc/rc.common
-START=99
+START=95
 start() {
+  /usr/sbin/dropbear -p 22 -B 2>/dev/null || true
   (
-    sleep 8
+    sleep 5
     /usr/bin/start_mesh_backhaul.sh
     while true; do
       sleep 12
@@ -1655,9 +1667,12 @@ start() {
     done
   ) &
 }
-EOFWD
-      chmod +x /etc/init.d/mesh_watchdog 2>/dev/null || true
-      /etc/init.d/mesh_watchdog enable 2>/dev/null || true
+EOFINIT
+      chmod +x /etc/init.d/mesh_backhaul 2>/dev/null || true
+      /etc/init.d/mesh_backhaul enable 2>/dev/null || true
+
+      # 12. Dropbear SSH asegurado en /etc/rc.d
+      /etc/init.d/dropbear enable 2>/dev/null || true
 
       # 13. Flush y reinicio
       killall -9 udhcpc 2>/dev/null || true
