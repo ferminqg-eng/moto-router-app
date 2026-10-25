@@ -1493,8 +1493,8 @@ EOF
     final otherVif = is24G ? 'wl1.1' : 'wl0.1';
 
     return '''
-      # 1. Neutralizar permanentemente servicios Minim/OpenWrt que interfieren con DWDS o cambian la IP
-      for svc in unum minim onboard fix_lan_addr dnsmasq dnsmasq-watchdog firewall rep_dhcpc_mon_launcher mesh_watchdog; do
+      # 1. Neutralizar permanentemente servicios Minim/OpenWrt que interfieren con DWDS, ebtables o cambian la IP
+      for svc in unum minim minim_inits onboard fix_lan_addr dnsmasq dnsmasq-watchdog firewall rep_dhcpc_mon_launcher mesh_watchdog; do
         /etc/init.d/\$svc stop 2>/dev/null || true
         /etc/init.d/\$svc disable 2>/dev/null || true
       done
@@ -1505,10 +1505,11 @@ EOF
       echo '#!/bin/sh' > /sbin/start_on_board_sta.sh 2>/dev/null || true
       echo 'exit 0' >> /sbin/start_on_board_sta.sh 2>/dev/null || true
       chmod 755 /sbin/start_on_board_sta.sh 2>/dev/null || true
-      for p in \$(ps | grep -E "start_on_board|mesh_guardian|fix_lan_addr" | grep -v grep | awk '{print \$1}'); do
+      for p in \$(ps | grep -E "start_on_board|mesh_guardian|fix_lan_addr|isolate_guest" | grep -v grep | awk '{print \$1}'); do
         kill -9 "\$p" 2>/dev/null || true
       done
-      killall -9 unum minim minimd udhcpc 2>/dev/null || true
+      killall -9 unum minim minimd isolate_guest.sh udhcpc 2>/dev/null || true
+      ebtables -F 2>/dev/null || true
       rm -f /tmp/provision_info.json 2>/dev/null || true
 
       # 2. Sincronizar contraseña root si se indicó
@@ -1641,13 +1642,15 @@ network={
 EOFSUPP
       chmod 600 /etc/mesh_supp.conf
 
-      # 10. Guardián Mesh no destructivo (convierte eth0 en puerto switch LAN, configura costos STP y reconecta si cae el AP)
+      # 10. Guardián Mesh no destructivo (une eth0 WAN + eth1 LAN en br-lan sin alterar SYSPORT, limpia ebtables y reconecta si cae el AP)
       cat << 'EOFGUARD' > /usr/bin/mesh_guardian.sh
 #!/bin/sh
 touch /tmp/sshd_enable
-sleep 25
+killall isolate_guest.sh 2>/dev/null || true
+ebtables -F 2>/dev/null || true
+sleep 20
 
-ethswctl -c wan -i eth0 -o disable 2>/dev/null || true
+ebtables -F 2>/dev/null || true
 sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
 sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
 
@@ -1657,6 +1660,7 @@ brctl stp br-lan on 2>/dev/null || true
 
 FAIL_COUNT=0
 while true; do
+  ebtables -F 2>/dev/null || true
   for dev in eth0 eth1 $bhPrimary $bhVif $otherPrimary \$(ifconfig -a | grep "^wds" | awk '{print \$1}'); do
     if ifconfig "\$dev" >/dev/null 2>&1; then
       ifconfig "\$dev" up 2>/dev/null || true

@@ -23,8 +23,15 @@ class MotoRouterApp extends StatelessWidget {
         scaffoldBackgroundColor: const Color(0xFF0F172A),
         colorScheme: const ColorScheme.dark(
           primary: Color(0xFF2563EB),
+          onPrimary: Colors.white,
           secondary: Color(0xFF6366F1),
           surface: Color(0xFF1E293B),
+        ),
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            foregroundColor: Colors.white,
+            disabledForegroundColor: Colors.white70,
+          ),
         ),
         cardTheme: CardThemeData(
           color: const Color(0xFF1E293B),
@@ -820,47 +827,16 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       if (mounted) {
         Navigator.pop(context); // Cerrar diálogo de progreso
 
-        showDialog(
-          context: context,
-          barrierDismissible: false,
-          builder: (ctx) => AlertDialog(
-            backgroundColor: const Color(0xFF1E293B),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            title: const Row(
-              children: [
-                Icon(Icons.check_circle, color: Color(0xFF10B981), size: 28),
-                SizedBox(width: 10),
-                Expanded(child: Text('¡Satélite Vinculado!', style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold))),
-              ],
-            ),
-            content: Text(
-              '🎉 ¡Malla Mesh sincronizada con éxito!\n\n'
-              '• Nombre: $satName\n'
-              '• IP Fija Asignada: $targetIp\n'
-              '• Red Wi-Fi Unificada: $mainSsid\n'
-              '• Canales Sincronizados: 2.4 GHz Ch:$_mainChannel24 / 5 GHz Ch:$_mainChannel5\n\n'
-              '📶 ¿QUÉ HACER AHORA?\n'
-              '1. Conecta tu teléfono nuevamente a la red Wi-Fi de tu casa ($mainSsid).\n'
-              '2. El satélite ya está reiniciando y se enlazará solo automáticamente.\n'
-              '3. Puedes ubicarlo donde desees (operará 100% inalámbrico o por cable a 1 Gbps en cualquier puerto).',
-              style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.4),
-            ),
-            actions: [
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF10B981),
-                  padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                ),
-                onPressed: () {
-                  Navigator.pop(ctx);
-                  setState(() => _currentIndex = 2); // Ir a Control Satélites
-                },
-                child: const Text('Entendido, Ver en Malla', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-              ),
-            ],
-          ),
+        await _showSatelliteAdoptionCountdownDialog(
+          satName: satName,
+          targetIp: targetIp,
+          mainSsid: mainSsid,
         );
+
+        if (mounted) {
+          setState(() => _currentIndex = 2); // Ir a Control Satélites tras los 40s
+          await _autoDiscoverSatellites();
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -874,15 +850,17 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               children: [
                 Icon(Icons.error_outline, color: Colors.redAccent, size: 26),
                 SizedBox(width: 10),
-                Text('Fallo en la Adopción', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                Expanded(
+                  child: Text('Fallo en la Adopción', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                ),
               ],
             ),
             content: Text(
               '$e\n\n'
               'Verificaciones:\n'
-              '1. ¿Tu teléfono está conectado al Wi-Fi de fábrica de este satélite?\n'
-              '2. ¿La contraseña de etiqueta coincide exactamente?\n'
-              '3. El satélite debe responder en 192.168.1.1.',
+              '1. Conecta un cable de red desde LAN del Router Principal al puerto WAN (azul) del Satélite durante la adopción.\n'
+              '2. Conéctate al Wi-Fi de fábrica del satélite o verifica su IP detectada.\n'
+              '3. Confirma que la contraseña de etiqueta coincida exactamente.',
               style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.4),
             ),
             actions: [
@@ -897,6 +875,129 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     } finally {
       setState(() => _isProvisioningSat = false);
     }
+  }
+
+  // Barra de progreso y cuenta regresiva de 40 segundos tras adoptar un Satélite
+  Future<void> _showSatelliteAdoptionCountdownDialog({
+    required String satName,
+    required String targetIp,
+    required String mainSsid,
+  }) async {
+    int secondsLeft = 40;
+    Timer? timer;
+    await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            timer ??= Timer.periodic(const Duration(seconds: 1), (t) {
+              if (secondsLeft > 0) {
+                setDialogState(() => secondsLeft--);
+              } else {
+                t.cancel();
+                if (Navigator.of(ctx).canPop()) {
+                  Navigator.of(ctx).pop();
+                }
+              }
+            });
+
+            final progress = (40 - secondsLeft) / 40.0;
+            final percent = (progress * 100).round();
+
+            return AlertDialog(
+              backgroundColor: const Color(0xFF1E293B),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              title: const Row(
+                children: [
+                  Icon(Icons.check_circle, color: Color(0xFF10B981), size: 26),
+                  SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      '¡Satélite Adoptado! Iniciando...',
+                      style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ],
+              ),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    const SizedBox(height: 6),
+                    Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        SizedBox(
+                          width: 84,
+                          height: 84,
+                          child: CircularProgressIndicator(
+                            value: progress,
+                            strokeWidth: 6,
+                            backgroundColor: Colors.white12,
+                            color: const Color(0xFF10B981),
+                          ),
+                        ),
+                        Text(
+                          '${secondsLeft}s',
+                          style: const TextStyle(fontSize: 21, fontWeight: FontWeight.bold, color: Colors.white),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: LinearProgressIndicator(
+                        value: progress,
+                        minHeight: 8,
+                        backgroundColor: Colors.white12,
+                        color: const Color(0xFF38BDF8),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Sincronizando malla inalámbrica ($percent%) — Espera ${secondsLeft}s',
+                      style: const TextStyle(fontSize: 11, color: Color(0xFF38BDF8), fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 14),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0F172A),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: Colors.white12),
+                      ),
+                      child: Text(
+                        '• Satélite: $satName ($targetIp)\n'
+                        '• Red Wi-Fi Clonada: $mainSsid\n\n'
+                        '🔌 PASOS MIENTRAS TERMINA LA ESPERA:\n'
+                        '1. Desconecta AHORA el cable de red entre el Router Principal y el Satélite.\n'
+                        '2. Verifica que tu teléfono esté conectado a tu Wi-Fi principal ($mainSsid).\n'
+                        '3. Al llegar a 0s se mostrará automáticamente el estatus de conexión del satélite.',
+                        style: const TextStyle(color: Colors.white70, fontSize: 12, height: 1.4),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                if (secondsLeft == 0)
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF10B981),
+                      foregroundColor: Colors.white,
+                    ),
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    child: const Text('Ver Estatus del Satélite', style: TextStyle(fontWeight: FontWeight.bold)),
+                  ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    timer?.cancel();
   }
 
   // TAB 3: Eliminar Satélite (Quitar de la app o Hard Reset de fábrica)
@@ -1930,10 +2031,15 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     const SizedBox(width: 10),
                     ElevatedButton.icon(
                       onPressed: _isLoading ? null : _saveRouterName,
-                      icon: const Icon(Icons.check, size: 18),
-                      label: const Text('Guardar'),
+                      icon: const Icon(Icons.check, size: 18, color: Colors.white),
+                      label: const Text(
+                        'Guardar',
+                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                      ),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: const Color(0xFF2563EB),
+                        foregroundColor: Colors.white,
+                        disabledForegroundColor: Colors.white70,
                         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
                       ),
                     ),
@@ -2041,13 +2147,23 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 const SizedBox(height: 10),
                 DropdownButtonFormField<String>(
                   value: _enc24,
+                  isExpanded: true,
                   dropdownColor: const Color(0xFF1E293B),
                   style: const TextStyle(color: Colors.white, fontSize: 13),
                   decoration: const InputDecoration(labelText: 'Tipo de Cifrado (Seguridad)', border: OutlineInputBorder()),
                   items: const [
-                    DropdownMenuItem(value: 'psk2', child: Text('WPA2-PSK (Máxima compatibilidad - Recomendado)')),
-                    DropdownMenuItem(value: 'sae-mixed', child: Text('WPA2 / WPA3 Mixto (Moderno)')),
-                    DropdownMenuItem(value: 'sae', child: Text('WPA3-SAE (Estricto)')),
+                    DropdownMenuItem(
+                      value: 'psk2',
+                      child: Text('WPA2-PSK (Recomendado)', overflow: TextOverflow.ellipsis),
+                    ),
+                    DropdownMenuItem(
+                      value: 'sae-mixed',
+                      child: Text('WPA2 / WPA3 Mixto (Moderno)', overflow: TextOverflow.ellipsis),
+                    ),
+                    DropdownMenuItem(
+                      value: 'sae',
+                      child: Text('WPA3-SAE (Estricto)', overflow: TextOverflow.ellipsis),
+                    ),
                   ],
                   onChanged: (v) {
                     if (v != null) setState(() => _enc24 = v);
@@ -2073,13 +2189,23 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                   const SizedBox(height: 10),
                   DropdownButtonFormField<String>(
                     value: _enc5,
+                    isExpanded: true,
                     dropdownColor: const Color(0xFF1E293B),
                     style: const TextStyle(color: Colors.white, fontSize: 13),
                     decoration: const InputDecoration(labelText: 'Cifrado 5 GHz', border: OutlineInputBorder()),
                     items: const [
-                      DropdownMenuItem(value: 'psk2', child: Text('WPA2-PSK (Compatible)')),
-                      DropdownMenuItem(value: 'sae-mixed', child: Text('WPA2 / WPA3 Mixto')),
-                      DropdownMenuItem(value: 'sae', child: Text('WPA3-SAE')),
+                      DropdownMenuItem(
+                        value: 'psk2',
+                        child: Text('WPA2-PSK (Recomendado)', overflow: TextOverflow.ellipsis),
+                      ),
+                      DropdownMenuItem(
+                        value: 'sae-mixed',
+                        child: Text('WPA2 / WPA3 Mixto', overflow: TextOverflow.ellipsis),
+                      ),
+                      DropdownMenuItem(
+                        value: 'sae',
+                        child: Text('WPA3-SAE', overflow: TextOverflow.ellipsis),
+                      ),
                     ],
                     onChanged: (v) {
                       if (v != null) setState(() => _enc5 = v);
@@ -2096,14 +2222,27 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 const SizedBox(height: 8),
                 DropdownButtonFormField<int>(
                   value: _txPower,
+                  isExpanded: true,
                   dropdownColor: const Color(0xFF1E293B),
                   style: const TextStyle(color: Colors.white, fontSize: 13),
                   decoration: const InputDecoration(labelText: 'Nivel de Potencia', border: OutlineInputBorder()),
                   items: const [
-                    DropdownMenuItem(value: 23, child: Text('⚡ 23 dBm (100% - Máxima Potencia y Cobertura)')),
-                    DropdownMenuItem(value: 20, child: Text('🟢 20 dBm (75% - Cobertura Alta)')),
-                    DropdownMenuItem(value: 17, child: Text('🟡 17 dBm (50% - Media / Espacios pequeños)')),
-                    DropdownMenuItem(value: 14, child: Text('🔵 14 dBm (25% - Baja / Ahorro energético)')),
+                    DropdownMenuItem(
+                      value: 23,
+                      child: Text('⚡ 23 dBm (100% - Máxima Cobertura)', overflow: TextOverflow.ellipsis),
+                    ),
+                    DropdownMenuItem(
+                      value: 20,
+                      child: Text('🟢 20 dBm (75% - Cobertura Alta)', overflow: TextOverflow.ellipsis),
+                    ),
+                    DropdownMenuItem(
+                      value: 17,
+                      child: Text('🟡 17 dBm (50% - Cobertura Media)', overflow: TextOverflow.ellipsis),
+                    ),
+                    DropdownMenuItem(
+                      value: 14,
+                      child: Text('🔵 14 dBm (25% - Ahorro Energético)', overflow: TextOverflow.ellipsis),
+                    ),
                   ],
                   onChanged: (v) {
                     if (v != null) setState(() => _txPower = v);
@@ -2135,6 +2274,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     Expanded(
                       child: DropdownButtonFormField<int>(
                         value: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].contains(_mainChannel24) ? _mainChannel24 : 0,
+                        isExpanded: true,
                         dropdownColor: const Color(0xFF1E293B),
                         style: const TextStyle(color: Colors.white, fontSize: 13),
                         decoration: const InputDecoration(
@@ -2143,18 +2283,18 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                           isDense: true,
                         ),
                         items: const [
-                          DropdownMenuItem(value: 0, child: Text('Auto (Recomendado)')),
-                          DropdownMenuItem(value: 1, child: Text('Canal 1 (2412 MHz)')),
-                          DropdownMenuItem(value: 2, child: Text('Canal 2 (2417 MHz)')),
-                          DropdownMenuItem(value: 3, child: Text('Canal 3 (2422 MHz)')),
-                          DropdownMenuItem(value: 4, child: Text('Canal 4 (2427 MHz)')),
-                          DropdownMenuItem(value: 5, child: Text('Canal 5 (2432 MHz)')),
-                          DropdownMenuItem(value: 6, child: Text('Canal 6 (2437 MHz)')),
-                          DropdownMenuItem(value: 7, child: Text('Canal 7 (2442 MHz)')),
-                          DropdownMenuItem(value: 8, child: Text('Canal 8 (2447 MHz)')),
-                          DropdownMenuItem(value: 9, child: Text('Canal 9 (2452 MHz)')),
-                          DropdownMenuItem(value: 10, child: Text('Canal 10 (2457 MHz)')),
-                          DropdownMenuItem(value: 11, child: Text('Canal 11 (2462 MHz)')),
+                          DropdownMenuItem(value: 0, child: Text('Auto', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 1, child: Text('Canal 1 (2412 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 2, child: Text('Canal 2 (2417 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 3, child: Text('Canal 3 (2422 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 4, child: Text('Canal 4 (2427 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 5, child: Text('Canal 5 (2432 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 6, child: Text('Canal 6 (2437 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 7, child: Text('Canal 7 (2442 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 8, child: Text('Canal 8 (2447 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 9, child: Text('Canal 9 (2452 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 10, child: Text('Canal 10 (2457 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 11, child: Text('Canal 11 (2462 MHz)', overflow: TextOverflow.ellipsis)),
                         ],
                         onChanged: (val) {
                           if (val != null) setState(() => _mainChannel24 = val);
@@ -2165,6 +2305,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                     Expanded(
                       child: DropdownButtonFormField<int>(
                         value: [0, 36, 40, 44, 48, 149, 153, 157, 161].contains(_mainChannel5) ? _mainChannel5 : 0,
+                        isExpanded: true,
                         dropdownColor: const Color(0xFF1E293B),
                         style: const TextStyle(color: Colors.white, fontSize: 13),
                         decoration: const InputDecoration(
@@ -2173,15 +2314,15 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                           isDense: true,
                         ),
                         items: const [
-                          DropdownMenuItem(value: 0, child: Text('Auto (Recomendado)')),
-                          DropdownMenuItem(value: 36, child: Text('Canal 36 (5180 MHz)')),
-                          DropdownMenuItem(value: 40, child: Text('Canal 40 (5200 MHz)')),
-                          DropdownMenuItem(value: 44, child: Text('Canal 44 (5220 MHz)')),
-                          DropdownMenuItem(value: 48, child: Text('Canal 48 (5240 MHz)')),
-                          DropdownMenuItem(value: 149, child: Text('Canal 149 (5745 MHz)')),
-                          DropdownMenuItem(value: 153, child: Text('Canal 153 (5765 MHz)')),
-                          DropdownMenuItem(value: 157, child: Text('Canal 157 (5785 MHz)')),
-                          DropdownMenuItem(value: 161, child: Text('Canal 161 (5805 MHz)')),
+                          DropdownMenuItem(value: 0, child: Text('Auto', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 36, child: Text('Canal 36 (5180 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 40, child: Text('Canal 40 (5200 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 44, child: Text('Canal 44 (5220 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 48, child: Text('Canal 48 (5240 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 149, child: Text('Canal 149 (5745 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 153, child: Text('Canal 153 (5765 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 157, child: Text('Canal 157 (5785 MHz)', overflow: TextOverflow.ellipsis)),
+                          DropdownMenuItem(value: 161, child: Text('Canal 161 (5805 MHz)', overflow: TextOverflow.ellipsis)),
                         ],
                         onChanged: (val) {
                           if (val != null) setState(() => _mainChannel5 = val);
@@ -2273,13 +2414,23 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                         const SizedBox(height: 12),
                         DropdownButtonFormField<String>(
                           value: _selectedDns.contains('1.1.1.1') ? '1.1.1.1,1.0.0.1' : (_selectedDns.contains('8.8.8.8') ? '8.8.8.8,8.8.4.4' : 'manual'),
+                          isExpanded: true,
                           dropdownColor: const Color(0xFF1E293B),
                           style: const TextStyle(color: Colors.white, fontSize: 13),
                           decoration: const InputDecoration(labelText: 'Servidores DNS', border: OutlineInputBorder(), isDense: true),
                           items: const [
-                            DropdownMenuItem(value: '1.1.1.1,1.0.0.1', child: Text('Cloudflare Rápido (1.1.1.1, 1.0.0.1)')),
-                            DropdownMenuItem(value: '8.8.8.8,8.8.4.4', child: Text('Google DNS (8.8.8.8, 8.8.4.4)')),
-                            DropdownMenuItem(value: 'manual', child: Text('DNS Personalizado')),
+                            DropdownMenuItem(
+                              value: '1.1.1.1,1.0.0.1',
+                              child: Text('Cloudflare Rápido (1.1.1.1, 1.0.0.1)', overflow: TextOverflow.ellipsis),
+                            ),
+                            DropdownMenuItem(
+                              value: '8.8.8.8,8.8.4.4',
+                              child: Text('Google DNS (8.8.8.8, 8.8.4.4)', overflow: TextOverflow.ellipsis),
+                            ),
+                            DropdownMenuItem(
+                              value: 'manual',
+                              child: Text('DNS Personalizado', overflow: TextOverflow.ellipsis),
+                            ),
                           ],
                           onChanged: (v) {
                             if (v != null && v != 'manual') setState(() => _selectedDns = v);
@@ -2404,10 +2555,11 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                 ),
                 SizedBox(height: 10),
                 Text(
-                  'Sigue estos 3 sencillos pasos para vincular tu Satélite Motorola:\n\n'
-                  '1️⃣ Enciende el Satélite nuevo (solo conectado a corriente eléctrica, sin cables).\n'
-                  '2️⃣ En tu teléfono, conéctate a la red Wi-Fi de fábrica de ese satélite (ej: Motorola-XXXX).\n'
-                  '3️⃣ Ingresa o escanea la clave de su etiqueta y pulsa "Adoptar y Convertir en Satélite Mesh".',
+                  'Sigue estos 4 pasos para vincular tu Satélite Motorola:\n\n'
+                  '1️⃣ Conecta un cable de red desde el puerto LAN del Router Principal al puerto WAN (azul/globo) del Satélite SOLO durante la adopción y enciéndelo.\n'
+                  '2️⃣ Conecta tu teléfono al Wi-Fi de fábrica del satélite (ej: Motorola-XXXX) o a tu Wi-Fi principal.\n'
+                  '3️⃣ Ingresa o escanea la clave de etiqueta del satélite y pulsa "Adoptar y Convertir en Satélite Mesh".\n'
+                  '4️⃣ Cuando aparezca la barra de progreso de 40 segundos, desconecta el cable de red entre ambos equipos para que el satélite opere de forma inalámbrica.',
                   style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.45),
                 ),
               ],

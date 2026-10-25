@@ -1,7 +1,7 @@
 name: lan_router_management
 description: "App Android para gestión local Lan Router Management"
 publish_to: 'none'
-version: 3.0.0+27
+version: 3.0.1+28
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
