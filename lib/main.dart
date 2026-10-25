@@ -243,8 +243,12 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         _routerNameController.text = status.hostname;
       });
 
-      _loadWifiConfig();
+      await _loadWifiConfig();
       _loadDhcpConfig();
+      // Habilitar automáticamente DWDS Nativo Broadcom + STP rápido en el Router Principal al iniciar sesión
+      RouterService.prepareMainRouterForWds(ip, pass).catchError((_) {});
+      // Auto-descubrir satélites activos (inalámbricos DWDS o cableados) en segundo plano
+      _autoDiscoverSatellites(silent: true);
       _showSnack('¡Conexión establecida con éxito!');
     } catch (e) {
       _showSnack('Error de conexión: $e', isError: true);
@@ -704,7 +708,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     final targetIp = _calculatedNextIp;
 
     double progressVal = 0.15;
-    String progressStep = 'Iniciando conexión con satélite en 192.168.1.1...';
+    String progressStep = 'Localizando satélite Motorola (10.10.11.1 / 192.168.1.1)...';
 
     setState(() => _isProvisioningSat = true);
 
@@ -764,15 +768,18 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
           ? (_mainBssid5.isNotEmpty ? _mainBssid5 : _mainBssid24)
           : (_mainBssid24.isNotEmpty ? _mainBssid24 : _mainBssid5);
 
-      try {
-        await RouterService.prepareMainRouterForWds(_currentIp, _currentPassword);
-      } catch (_) {}
-
       String targetSatGateway = '192.168.1.1';
       try {
         final detected = await RouterService.detectSatelliteGateway();
         if (detected.isNotEmpty) targetSatGateway = detected;
       } catch (_) {}
+
+      // Si el satélite está en 10.10.11.1 (cable WAN conectado al principal), podemos asegurar DWDS en 192.168.1.1 también aquí
+      if (targetSatGateway != _currentIp) {
+        try {
+          await RouterService.prepareMainRouterForWds(_currentIp, _currentPassword);
+        } catch (_) {}
+      }
 
       final satMac = await RouterService.provisionSatelliteDirect(
         satIp: targetSatGateway,
@@ -796,14 +803,16 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         },
       );
 
-      final existingIdx = _meshNodes.indexWhere((n) => n.ip == targetIp);
+      final effectiveNodePass = mainKey.isNotEmpty ? mainKey : satPass;
+      final existingIdx = _meshNodes.indexWhere((n) => n.ip == targetIp || (satMac.isNotEmpty && n.mac.toUpperCase() == satMac.toUpperCase()));
       if (existingIdx != -1) {
+        _meshNodes[existingIdx].ip = targetIp;
         _meshNodes[existingIdx].name = satName;
         _meshNodes[existingIdx].mac = satMac;
-        _meshNodes[existingIdx].password = satPass;
+        _meshNodes[existingIdx].password = effectiveNodePass;
         _meshNodes[existingIdx].backhaulBand = _selectedBackhaulBand;
       } else {
-        _meshNodes.add(MeshNode(name: satName, ip: targetIp, mac: satMac, password: satPass, backhaulBand: _selectedBackhaulBand));
+        _meshNodes.add(MeshNode(name: satName, ip: targetIp, mac: satMac, password: effectiveNodePass, backhaulBand: _selectedBackhaulBand));
       }
       await _persistMeshNodes();
       await _calculateNextIp();
@@ -956,7 +965,11 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               Navigator.pop(ctx);
               _showSnack('Restableciendo ${node.name} a valores de fábrica...');
               try {
-                await RouterService.factoryResetSatellite(node.ip, node.password);
+                await RouterService.factoryResetSatellite(
+                  node.ip,
+                  node.password.isNotEmpty ? node.password : _currentPassword,
+                  fallbackPasswords: _nodeFallbackPasswords,
+                );
               } catch (_) {}
               setState(() {
                 _meshNodes.removeWhere((n) => n.ip == node.ip);
@@ -1314,51 +1327,85 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     );
   }
 
-  // TAB 3: Auto-detección dinámica de Satélites en la Red (DHCP/ARP)
-  Future<void> _autoDiscoverSatellites() async {
+  List<String> get _nodeFallbackPasswords => [
+        _key24Controller.text.trim(),
+        _currentPassword,
+        _addSatMainKeyController.text.trim(),
+        _addSatPassController.text.trim(),
+        ..._meshNodes.map((n) => n.password),
+      ];
+
+  // TAB 3: Auto-detección dinámica de Satélites en la Red (DWDS Inalámbrico + Cable + ARP)
+  Future<void> _autoDiscoverSatellites({bool silent = false}) async {
     setState(() => _isDiscoveringSatellites = true);
-    _showSnack('Escaneando la red en busca de satélites activos...');
+    if (!silent) {
+      _showSnack('Escaneando la malla Mesh (DWDS y LAN) en busca de satélites activos...');
+    }
     try {
-      final leases = await RouterService.getDhcpLeases(_currentIp, _currentPassword);
-      int updatedCount = 0;
+      final discovered = await RouterService.discoverActiveMeshSatellites(
+        _currentIp,
+        _currentPassword,
+        candidatePasswords: _nodeFallbackPasswords,
+      );
 
-      for (var lease in leases) {
-        final ip = lease.ip;
-        final mac = lease.mac.toLowerCase();
-
-        if (ip == _currentIp) continue;
-
-        // Solo actualizar IP si la MAC coincide exactamente y el nodo no tiene IP fija manual
-        for (var node in _meshNodes) {
-          if (node.mac.isNotEmpty && node.mac.toLowerCase() == mac) {
-            final isStandardStatic = node.ip.startsWith('192.168.1.2') || 
-                                     node.ip.startsWith('192.168.1.3') || 
-                                     node.ip.startsWith('192.168.1.4') || 
-                                     node.ip.startsWith('192.168.1.5');
-            if (node.ip != ip && !isStandardStatic) {
-              final oldIp = node.ip;
-              node.ip = ip;
-              updatedCount++;
-              _showSnack('✔ Satélite detectado dinámicamente en IP $ip (anterior: $oldIp)');
-            }
-            break;
+      bool changed = false;
+      for (final d in discovered) {
+        final existingIdx = _meshNodes.indexWhere(
+          (n) => (n.mac.isNotEmpty && d.mac.isNotEmpty && n.mac.toUpperCase() == d.mac.toUpperCase()) || n.ip == d.ip,
+        );
+        if (existingIdx != -1) {
+          final existing = _meshNodes[existingIdx];
+          if (existing.ip != d.ip) {
+            existing.ip = d.ip;
+            changed = true;
           }
+          if (existing.mac.isEmpty && d.mac.isNotEmpty) {
+            existing.mac = d.mac;
+            changed = true;
+          }
+          if (d.hostname.isNotEmpty && (existing.name.startsWith('Satélite (') || existing.name == 'Satélite')) {
+            existing.name = d.hostname;
+            changed = true;
+          }
+          if (existing.backhaulBand != d.backhaulBand) {
+            existing.backhaulBand = d.backhaulBand;
+            changed = true;
+          }
+        } else {
+          final defaultPass = _key24Controller.text.trim().isNotEmpty ? _key24Controller.text.trim() : _currentPassword;
+          setState(() {
+            _meshNodes.add(MeshNode(
+              name: d.hostname,
+              ip: d.ip,
+              mac: d.mac,
+              password: defaultPass,
+              backhaulBand: d.backhaulBand,
+            ));
+          });
+          changed = true;
         }
       }
 
-      if (updatedCount > 0) {
+      if (changed) {
         await _persistMeshNodes();
+        await _calculateNextIp();
       }
 
-      // Probar conectividad y calidad de todos los nodos guardados
+      // Probar conectividad y calidad (incluyendo RSSI DWDS real) de todos los nodos guardados
       for (var n in _meshNodes) {
         await _checkNodeQuality(n);
       }
-      _showSnack('Escaneo completado. Satélites sincronizados.');
+      if (!silent) {
+        _showSnack('✔ Escaneo completado (${_meshNodes.length} satélite(s) en malla).');
+      }
     } catch (e) {
-      _showSnack('Error al verificar satélites: $e', isError: true);
+      if (!silent) {
+        _showSnack('Error al verificar satélites: $e', isError: true);
+      }
     } finally {
-      setState(() => _isDiscoveringSatellites = false);
+      if (mounted) {
+        setState(() => _isDiscoveringSatellites = false);
+      }
     }
   }
 
@@ -1406,6 +1453,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
           mainSsid: mainSsid,
           mainKey: mainKey,
           targetBand: targetBand,
+          fallbackPasswords: _nodeFallbackPasswords,
         );
         setState(() => node.backhaulBand = targetBand);
         await _persistMeshNodes();
@@ -1496,6 +1544,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
           targetIp: targetIp,
           satName: node.name,
           satMac: node.mac,
+          extraPasswords: _nodeFallbackPasswords,
         );
         setState(() => node.ip = targetIp);
         await _persistMeshNodes();
@@ -1546,8 +1595,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     final pass = node.password.isNotEmpty ? node.password : _currentPassword;
     _showSnack('Ajustando potencia en ${node.name} (${node.ip})...');
     try {
-      await RouterService.setSatelliteTxPower(node.ip, pass, power);
+      await RouterService.setSatelliteTxPower(node.ip, pass, power, fallbackPasswords: _nodeFallbackPasswords);
       setState(() => node.txPower = power);
+      await _persistMeshNodes();
       _showSnack('Potencia ajustada a $power dBm en ${node.name}');
     } catch (e) {
       _showSnack('Error al ajustar potencia en ${node.name}: $e', isError: true);
@@ -1585,8 +1635,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     if (newName != null && newName.isNotEmpty) {
       final pass = node.password.isNotEmpty ? node.password : _currentPassword;
       try {
-        await RouterService.setHostname(node.ip, pass, newName);
+        await RouterService.setHostname(node.ip, pass, newName, fallbackPasswords: _nodeFallbackPasswords);
         setState(() => node.name = newName);
+        await _persistMeshNodes();
         _showSnack('Nombre cambiado a "$newName" en ${node.ip}');
       } catch (e) {
         _showSnack('Error al cambiar nombre: $e', isError: true);
@@ -1618,7 +1669,12 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     final pass = node.password.isNotEmpty ? node.password : _currentPassword;
     _showSnack('Enviando reinicio a ${node.name} (${node.ip})...');
     try {
-      await RouterService.rebootRouter(node.ip, pass, fallbackPassword: _currentPassword);
+      await RouterService.rebootRouter(
+        node.ip,
+        pass,
+        fallbackPassword: _currentPassword,
+        extraPasswords: _nodeFallbackPasswords,
+      );
       _showSnack('✔ Reinicio ejecutado en ${node.name}. Reconectando en ~60s...');
     } catch (e) {
       _showSnack('Error al reiniciar ${node.name}: $e', isError: true);
@@ -2593,11 +2649,11 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               children: [
                 Expanded(
                   child: ElevatedButton.icon(
-                    onPressed: _isDiscoveringSatellites ? null : _autoDiscoverSatellites,
+                    onPressed: _isDiscoveringSatellites ? null : () => _autoDiscoverSatellites(),
                     icon: _isDiscoveringSatellites
                         ? const SizedBox(height: 14, width: 14, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
                         : const Icon(Icons.radar, size: 16, color: Colors.white),
-                    label: const Text('Detectar IP', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
+                    label: const Text('Detectar Satélites', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF0284C7),
                       foregroundColor: Colors.white,

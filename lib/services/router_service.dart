@@ -163,6 +163,20 @@ class CableSatelliteCandidate {
   });
 }
 
+class DiscoveredSatelliteInfo {
+  final String ip;
+  final String mac;
+  final String hostname;
+  final String backhaulBand;
+
+  DiscoveredSatelliteInfo({
+    required this.ip,
+    required this.mac,
+    required this.hostname,
+    required this.backhaulBand,
+  });
+}
+
 class RouterService {
   /// Desbloquea y arranca LuCI y SSH directamente desde la app mediante POST con contraseña,
   /// preservando las cookies de sesión (sysauth / sysauth_https) y verificando el puerto 22
@@ -280,6 +294,33 @@ class RouterService {
     }
   }
 
+  /// Ejecuta comando SSH probando múltiples contraseñas candidatas y desbloqueando SSH si es necesario
+  static Future<String> executeSSHMultiAuth(String ip, List<String> candidatePasswords, String command) async {
+    final passwords = <String>[];
+    for (final p in candidatePasswords) {
+      final clean = p.trim();
+      if (clean.isNotEmpty && !passwords.contains(clean)) {
+        passwords.add(clean);
+      }
+    }
+
+    Object? lastErr;
+    for (final pass in passwords) {
+      try {
+        return await executeSSH(ip, pass, command);
+      } catch (e) {
+        lastErr = e;
+        try {
+          await unlockRouter(ip, pass);
+          return await executeSSH(ip, pass, command);
+        } catch (e2) {
+          lastErr = e2;
+        }
+      }
+    }
+    throw Exception('No se pudo autenticar por SSH en $ip (${lastErr ?? "sin respuesta"})');
+  }
+
   /// Lee estado general, modelo, hostname, estado de Minim/Unum y clientes conectados
   static Future<RouterStatus> getStatus(String ip, String password) async {
     const script = '''
@@ -357,16 +398,18 @@ class RouterService {
   }
 
   /// Cambia el nombre del equipo (Hostname)
-  static Future<void> setHostname(String ip, String password, String hostname) async {
+  static Future<void> setHostname(String ip, String password, String hostname, {List<String> fallbackPasswords = const []}) async {
     final clean = hostname.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
     final cleanHost = clean.replaceAll(RegExp(r'\s+'), '-');
     final script = '''
       uci set system.@system[0].hostname='$cleanHost'
       uci commit system
       echo '$cleanHost' > /proc/sys/kernel/hostname
+      nvram set router_name='$cleanHost' 2>/dev/null || true
+      nvram commit 2>/dev/null || true
       /etc/init.d/system reload 2>/dev/null || true
     ''';
-    await executeSSH(ip, password, script);
+    await executeSSHMultiAuth(ip, [password, ...fallbackPasswords], script);
   }
 
   /// Detiene y deshabilita permanentemente el agente de la nube unum (Minim/MotoSync)
@@ -376,20 +419,37 @@ class RouterService {
       /etc/init.d/unum disable 2>/dev/null || true
       /etc/init.d/minim stop 2>/dev/null || true
       /etc/init.d/minim disable 2>/dev/null || true
+      /etc/init.d/onboard stop 2>/dev/null || true
+      /etc/init.d/onboard disable 2>/dev/null || true
+      echo '#!/bin/sh' > /sbin/start_on_board_sta.sh 2>/dev/null || true
+      echo 'exit 0' >> /sbin/start_on_board_sta.sh 2>/dev/null || true
+      chmod 755 /sbin/start_on_board_sta.sh 2>/dev/null || true
+      for p in \$(ps | grep "start_on_board" | grep -v grep | awk '{print \$1}'); do
+        kill -9 "\$p" 2>/dev/null || true
+      done
       killall -9 unum 2>/dev/null || true
       killall -9 minim 2>/dev/null || true
       killall -9 minimd 2>/dev/null || true
-      chmod 644 /usr/bin/unum 2>/dev/null || true
+      echo '#!/bin/sh' > /usr/bin/unum 2>/dev/null || true
+      echo 'exit 0' >> /usr/bin/unum 2>/dev/null || true
+      chmod 755 /usr/bin/unum 2>/dev/null || true
       rm -f /tmp/provision_info.json 2>/dev/null || true
 
-      # Garantizar entrega instantánea de DHCP en el puerto LAN físico (eth1)
+      # Habilitar SSH persistente en arranque
+      /usr/sbin/fw_setenv sshd_enable 1 2>/dev/null || true
+      /etc/init.d/dropbear restart_admin_enable 2>/dev/null || true
+
+      # Garantizar entrega de DHCP y puente STP rápido (2s) libre de bucles en Router Principal
       uci -q set dhcp.lan.ignore='0'
       uci -q set dhcp.lan.authoritative='1'
       uci -q set dhcp.@dnsmasq[0].authoritative='1'
       uci commit dhcp 2>/dev/null || true
-      uci -q set network.lan.stp='0'
+      uci -q set network.lan.stp='1'
+      uci -q set network.lan.forward_delay='2'
       uci commit network 2>/dev/null || true
-      brctl stp br-lan off 2>/dev/null || true
+      brctl setbridgeprio br-lan 16384 2>/dev/null || true
+      brctl setfd br-lan 2 2>/dev/null || true
+      brctl stp br-lan on 2>/dev/null || true
       /etc/init.d/dnsmasq restart 2>/dev/null || true
     ''';
     await executeSSH(ip, password, script);
@@ -419,31 +479,17 @@ class RouterService {
   }
 
   /// Reinicia el router de forma remota
-  static Future<void> rebootRouter(String ip, String password, {String? fallbackPassword}) async {
+  static Future<void> rebootRouter(String ip, String password, {String? fallbackPassword, List<String> extraPasswords = const []}) async {
     const script = '''
-      (sleep 1 && reboot -f) &
+      (sleep 1 && reboot -f) >/dev/null 2>&1 &
       echo "REBOOT_INITIATED"
     ''';
 
-    final passwords = <String>[];
-    if (password.isNotEmpty) passwords.add(password);
-    if (fallbackPassword != null && fallbackPassword.isNotEmpty && !passwords.contains(fallbackPassword)) {
-      passwords.add(fallbackPassword);
-    }
-
-    for (final pass in passwords) {
-      try {
-        await executeSSH(ip, pass, script);
-        return;
-      } catch (_) {
-        try {
-          await unlockRouter(ip, pass);
-          await executeSSH(ip, pass, script);
-          return;
-        } catch (_) {}
-      }
-    }
-    throw Exception('No se pudo conectar a $ip para reiniciar.');
+    await executeSSHMultiAuth(ip, [
+      password,
+      if (fallbackPassword != null) fallbackPassword,
+      ...extraPasswords,
+    ], script);
   }
 
   /// Lee la configuración Wi-Fi actual del router, incluyendo potencia, cifrado, canales y BSSID
@@ -455,8 +501,8 @@ class RouterService {
       echo "===KEY1===" && (nvram get wl1_wpa_psk || uci -q get wireless.default_wl1.key || echo "")
       echo "===TXPOWER===" && uci -q get wireless.radio0.txpower || echo "23"
       echo "===LEGACY===" && uci -q get wireless.radio0.legacy_mode || echo "0"
-      echo "===CHAN0===" && (wl -i wl0 channel 2>/dev/null || uci -q get wireless.radio0.channel || echo "6")
-      echo "===CHAN1===" && (wl -i wl1 channel 2>/dev/null || uci -q get wireless.radio1.channel || echo "36")
+      echo "===CHAN0===" && (nvram get wl0_channel 2>/dev/null || uci -q get wireless.radio0.channel || echo "0")
+      echo "===CHAN1===" && (nvram get wl1_channel 2>/dev/null || uci -q get wireless.radio1.channel || echo "0")
       echo "===BSSID0===" && (wl -i wl0 cur_etheraddr 2>/dev/null || cat /sys/class/net/eth1/address 2>/dev/null || echo "")
       echo "===BSSID1===" && (wl -i wl1 cur_etheraddr 2>/dev/null || cat /sys/class/net/eth2/address 2>/dev/null || echo "")
       echo "===WIRELESS===" && uci show wireless
@@ -548,16 +594,24 @@ class RouterService {
   }
 
   /// Aplica cambios Wi-Fi (bandas, cifrado, potencia de transmisión y modo legacy Wi-Fi 6)
-  /// Neutraliza unum, activa LazyWDS en router principal, persiste en NVRAM y en UCI
+  /// Neutraliza unum/onboard, activa DWDS nativo Broadcom en router principal, persiste en NVRAM y en UCI
   static Future<void> saveWifiConfig(String ip, String password, WifiConfigData cfg) async {
     final commands = <String>[];
 
-    // 1. Apagar y neutralizar permanentemente unum/minim de forma limpia sin romper procd
+    // 1. Apagar y neutralizar permanentemente unum/minim/onboard y habilitar SSH persistente
     commands.add('''
       /etc/init.d/unum stop 2>/dev/null || true
       /etc/init.d/unum disable 2>/dev/null || true
       /etc/init.d/minim stop 2>/dev/null || true
       /etc/init.d/minim disable 2>/dev/null || true
+      /etc/init.d/onboard stop 2>/dev/null || true
+      /etc/init.d/onboard disable 2>/dev/null || true
+      echo '#!/bin/sh' > /sbin/start_on_board_sta.sh 2>/dev/null || true
+      echo 'exit 0' >> /sbin/start_on_board_sta.sh 2>/dev/null || true
+      chmod 755 /sbin/start_on_board_sta.sh 2>/dev/null || true
+      for p in \$(ps | grep "start_on_board" | grep -v grep | awk '{print \$1}'); do
+        kill -9 "\$p" 2>/dev/null || true
+      done
       killall -9 unum 2>/dev/null || true
       killall -9 minim 2>/dev/null || true
       killall -9 minimd 2>/dev/null || true
@@ -565,16 +619,33 @@ class RouterService {
       echo 'exit 0' >> /usr/bin/unum 2>/dev/null || true
       chmod 755 /usr/bin/unum 2>/dev/null || true
       rm -f /tmp/provision_info.json 2>/dev/null || true
+      /usr/sbin/fw_setenv sshd_enable 1 2>/dev/null || true
+      /etc/init.d/dropbear restart_admin_enable 2>/dev/null || true
+
+      mkdir -p /etc/hotplug.d/net
+      cat << 'EOF' > /etc/hotplug.d/net/99-wds-bridge
+if echo "\$INTERFACE" | grep -q "^wds"; then
+  ifconfig "\$INTERFACE" up 2>/dev/null || true
+  brctl addif br-lan "\$INTERFACE" 2>/dev/null || true
+  brctl setbridgeprio br-lan 16384 2>/dev/null || true
+  brctl setfd br-lan 2 2>/dev/null || true
+  brctl stp br-lan on 2>/dev/null || true
+fi
+EOF
+      chmod +x /etc/hotplug.d/net/99-wds-bridge 2>/dev/null || true
+      uci -q set network.lan.stp='1'
+      uci -q set network.lan.forward_delay='2'
+      uci commit network 2>/dev/null || true
     ''');
 
-    final ssid24 = cfg.ssid24;
-    final key24 = cfg.key24;
+    final ssid24 = cfg.ssid24.replaceAll('Current SSID:', '').replaceAll('"', '').trim();
+    final key24 = cfg.key24.trim();
     final enc24 = cfg.enc24;
-    final ssid5 = cfg.separateBands ? cfg.ssid5 : cfg.ssid24;
-    final key5 = cfg.separateBands ? cfg.key5 : cfg.key24;
+    final ssid5 = (cfg.separateBands ? cfg.ssid5 : cfg.ssid24).replaceAll('Current SSID:', '').replaceAll('"', '').trim();
+    final key5 = (cfg.separateBands ? cfg.key5 : cfg.key24).trim();
     final enc5 = cfg.separateBands ? cfg.enc5 : cfg.enc24;
 
-    // 2. Persistir en NVRAM (Broadcom wl carga de aquí en boot) sin corromper wl0_wds
+    // 2. Persistir en NVRAM (Broadcom wlssk carga de aquí en boot) con DWDS nativo activo
     commands.add('''
       if which nvram >/dev/null 2>&1; then
         ${ssid24.isNotEmpty ? "nvram set wl0_ssid='$ssid24'" : ""}
@@ -585,8 +656,12 @@ class RouterService {
         ${key24.isNotEmpty ? "nvram set wl_wpa_psk='$key24'" : ""}
         nvram set wl0_akm='psk2'
         nvram set wl1_akm='psk2'
+        nvram set wl0_crypto='aes'
+        nvram set wl1_crypto='aes'
         nvram set wl0_txpwr='${cfg.txPower}'
         nvram set wl1_txpwr='${cfg.txPower}'
+        nvram set wl0_dwds='1'
+        nvram set wl1_dwds='1'
         nvram set wl0_lazywds='1'
         nvram set wl1_lazywds='1'
         nvram unset wl0_wds 2>/dev/null || true
@@ -595,7 +670,7 @@ class RouterService {
       fi
     ''');
 
-    // 3. Inyección inmediata en caliente a los radios Broadcom wl con LazyWDS
+    // 3. Inyección inmediata en caliente a los radios Broadcom wl
     commands.add('''
       ${ssid24.isNotEmpty ? "wl -i wl0 ssid '$ssid24' 2>/dev/null || true" : ""}
       ${ssid5.isNotEmpty ? "wl -i wl1 ssid '$ssid5' 2>/dev/null || true" : ""}
@@ -607,22 +682,22 @@ class RouterService {
       wl -i wl1 lazywds 1 2>/dev/null || true
     ''');
 
-    // 3.5 Guardar Canales Wi-Fi en UCI y NVRAM
+    // 3.5 Guardar Canales Wi-Fi en UCI y NVRAM (chanspec Broadcom)
     if (cfg.channel24 == 0) {
       commands.add("uci -q set wireless.radio0.channel='auto'");
-      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl0_channel='0' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
+      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl0_channel='0' 2>/dev/null || true; nvram set wl0_chanspec='0' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
     } else {
       commands.add("uci -q set wireless.radio0.channel='${cfg.channel24}'");
-      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl0_channel='${cfg.channel24}' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
+      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl0_channel='${cfg.channel24}' 2>/dev/null || true; nvram set wl0_chanspec='${cfg.channel24}' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
       commands.add("wl -i wl0 channel ${cfg.channel24} 2>/dev/null || true");
     }
 
     if (cfg.channel5 == 0) {
       commands.add("uci -q set wireless.radio1.channel='auto'");
-      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl1_channel='0' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
+      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl1_channel='0' 2>/dev/null || true; nvram set wl1_chanspec='0' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
     } else {
       commands.add("uci -q set wireless.radio1.channel='${cfg.channel5}'");
-      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl1_channel='${cfg.channel5}' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
+      commands.add("if which nvram >/dev/null 2>&1; then nvram set wl1_channel='${cfg.channel5}' 2>/dev/null || true; nvram set wl1_chanspec='${cfg.channel5}/80' 2>/dev/null || true; nvram commit 2>/dev/null || true; fi");
       commands.add("wl -i wl1 channel ${cfg.channel5} 2>/dev/null || true");
     }
 
@@ -677,7 +752,7 @@ class RouterService {
     commands.add('uci commit wireless');
     commands.add('sync');
     commands.add('sync');
-    commands.add('(sleep 2 && reboot) &');
+    commands.add('(sleep 2 && reboot) >/dev/null 2>&1 &');
 
     try {
       await executeSSH(ip, password, commands.join('\n'));
@@ -686,13 +761,29 @@ class RouterService {
     }
   }
 
-  /// Mide la calidad de conexión entre el router principal y un satélite
+  /// Mide la calidad de conexión real entre el router principal y un satélite (Cable vs DWDS 2.4G / 5G + RSSI Broadcom)
   static Future<SatelliteQuality> checkSatelliteQuality(String mainIp, String mainPassword, String satIp) async {
     final script = '''
-      # Ping para latencia
       ping -c 3 -W 1 $satIp 2>/dev/null || echo "PING_FAIL"
-      echo "===ARP===" && cat /proc/net/arp | grep -w '$satIp' || true
-      echo "===IW===" && (iw dev wl0 station dump 2>/dev/null; iw dev wl1 station dump 2>/dev/null; iw dev wlan0 station dump 2>/dev/null; iw dev wlan1 station dump 2>/dev/null; wl -i wl0 assoclist 2>/dev/null; wl -i wl1 assoclist 2>/dev/null) || true
+      SAT_MAC=\$(awk '\$1=="$satIp" {print tolower(\$4)}' /proc/net/arp | head -n 1)
+      echo "===SAT_MAC===\$SAT_MAC"
+      if [ -n "\$SAT_MAC" ]; then
+        PORT_NO=\$(brctl showmacs br-lan 2>/dev/null | awk -v m="\$SAT_MAC" 'tolower(\$2)==m {print \$1}' | head -n 1)
+        for p in /sys/class/net/br-lan/brif/*; do
+          PNUM=\$(printf "%d" \$(cat "\$p/port_no" 2>/dev/null) 2>/dev/null)
+          if [ "\$PNUM" = "\$PORT_NO" ]; then
+            echo "===BR_PORT===\$(basename \$p)"
+          fi
+        done
+      fi
+      echo "===DWDS0==="
+      for m in \$(wl -i wl0 dwdslist 2>/dev/null | awk '{print \$2}'); do
+        echo "WDS0_MAC:\$m RSSI:\$(wl -i wl0 rssi \$m 2>/dev/null)"
+      done
+      echo "===DWDS1==="
+      for m in \$(wl -i wl1 dwdslist 2>/dev/null | awk '{print \$2}'); do
+        echo "WDS1_MAC:\$m RSSI:\$(wl -i wl1 rssi \$m 2>/dev/null)"
+      done
     ''';
 
     final output = await executeSSH(mainIp, mainPassword, script);
@@ -707,45 +798,75 @@ class RouterService {
       );
     }
 
-    // Extraer latencia de ping
     double latency = 1.5;
     final rttMatch = RegExp(r'avg = ([0-9.]+)|min/avg/max = [0-9.]+/([0-9.]+)/').firstMatch(output);
     if (rttMatch != null) {
       latency = double.tryParse(rttMatch.group(1) ?? rttMatch.group(2) ?? '1.5') ?? 1.5;
     }
 
-    // Buscar señal Wi-Fi
-    int signal = -60;
-    bool isWireless = false;
-    final sigMatch = RegExp(r'signal:\s*(-[0-9]+)\s*dBm').firstMatch(output);
-    if (sigMatch != null) {
-      signal = int.tryParse(sigMatch.group(1) ?? '-60') ?? -60;
-      isWireless = true;
+    String brPort = '';
+    final portMatch = RegExp(r'===BR_PORT===([^\s\r\n]+)').firstMatch(output);
+    if (portMatch != null) {
+      brPort = portMatch.group(1)!.trim();
     }
 
-    // Calcular calidad porcentual
+    String satMacPrefix = '';
+    final macMatch = RegExp(r'===SAT_MAC===([0-9a-f:]+)').firstMatch(output);
+    if (macMatch != null && macMatch.group(1)!.length >= 14) {
+      satMacPrefix = macMatch.group(1)!.substring(0, 14).toUpperCase();
+    }
+
+    int signal = -55;
+    bool isWireless = brPort.startsWith('wds') || brPort.startsWith('wl');
+    String wirelessBand = brPort.startsWith('wds1') || brPort.startsWith('wl1') ? '5 GHz' : '2.4 GHz';
+
+    // Extraer RSSI exacto de la lista DWDS de Broadcom
+    final wds0Matches = RegExp(r'WDS0_MAC:([0-9A-Fa-f:]+)\s+RSSI:(-?[0-9]+)').allMatches(output);
+    for (final m in wds0Matches) {
+      final wmac = m.group(1)!.toUpperCase();
+      final rssi = int.tryParse(m.group(2) ?? '') ?? -55;
+      if (brPort.startsWith('wds0') || (satMacPrefix.isNotEmpty && wmac.startsWith(satMacPrefix))) {
+        signal = rssi;
+        isWireless = true;
+        wirelessBand = '2.4 GHz';
+        break;
+      }
+    }
+
+    final wds1Matches = RegExp(r'WDS1_MAC:([0-9A-Fa-f:]+)\s+RSSI:(-?[0-9]+)').allMatches(output);
+    for (final m in wds1Matches) {
+      final wmac = m.group(1)!.toUpperCase();
+      final rssi = int.tryParse(m.group(2) ?? '') ?? -55;
+      if (brPort.startsWith('wds1') || (satMacPrefix.isNotEmpty && wmac.startsWith(satMacPrefix))) {
+        signal = rssi;
+        isWireless = true;
+        wirelessBand = '5 GHz';
+        break;
+      }
+    }
+
     int quality;
     String status;
     String linkType;
 
-    if (!isWireless && latency < 2.5) {
+    if (!isWireless) {
       linkType = 'Ethernet por Cable (1 Gbps)';
       quality = 100;
       status = 'Excelente (Enlace gigabit por cable)';
     } else {
-      linkType = 'Wi-Fi Mesh Backhaul';
+      linkType = 'Wi-Fi Mesh DWDS ($wirelessBand)';
       if (signal >= -55) {
         quality = 95;
-        status = 'Excelente (-${signal.abs()} dBm)';
+        status = 'Excelente ($signal dBm • $wirelessBand)';
       } else if (signal >= -68) {
         quality = 80;
-        status = 'Buena (-${signal.abs()} dBm)';
+        status = 'Buena ($signal dBm • $wirelessBand)';
       } else if (signal >= -78) {
         quality = 55;
-        status = 'Regular (-${signal.abs()} dBm - Recomendado acercar)';
+        status = 'Regular ($signal dBm • Recomendado acercar)';
       } else {
         quality = 30;
-        status = 'Débil (-${signal.abs()} dBm - Muy lejos)';
+        status = 'Débil ($signal dBm • Muy lejos)';
       }
     }
 
@@ -759,18 +880,103 @@ class RouterService {
     );
   }
 
-  /// Ajusta la potencia de transmisión (Tx Power) en un satélite específico
-  static Future<void> setSatelliteTxPower(String satIp, String satPassword, int txPower) async {
+  /// Descubre automáticamente satélites activos en la malla (tanto inalámbricos DWDS como cableados en 192.168.1.2-.5)
+  static Future<List<DiscoveredSatelliteInfo>> discoverActiveMeshSatellites(
+    String mainIp,
+    String mainPassword, {
+    List<String> candidatePasswords = const [],
+  }) async {
+    final prefixParts = mainIp.split('.');
+    final subnetPrefix = prefixParts.length == 4 ? '${prefixParts[0]}.${prefixParts[1]}.${prefixParts[2]}' : '192.168.1';
+    final scanIps = ['$subnetPrefix.2', '$subnetPrefix.3', '$subnetPrefix.4', '$subnetPrefix.5'];
+    final pingCmd = scanIps.where((ip) => ip != mainIp).map((ip) => 'ping -c 1 -W 1 $ip >/dev/null 2>&1 &').join(' ');
+
     final script = '''
+      $pingCmd
+      wait
+      echo "===ARP==="
+      cat /proc/net/arp 2>/dev/null
+      echo "===BRMACS==="
+      for p in /sys/class/net/br-lan/brif/*; do
+        PNUM=\$(printf "%d" \$(cat "\$p/port_no" 2>/dev/null) 2>/dev/null)
+        echo "PORTMAP:\$PNUM:\$(basename \$p)"
+      done
+      brctl showmacs br-lan 2>/dev/null
+    ''';
+
+    final out = await executeSSH(mainIp, mainPassword, script);
+    final portMap = <String, String>{};
+    for (final m in RegExp(r'PORTMAP:(\d+):([^\s\r\n]+)').allMatches(out)) {
+      portMap[m.group(1)!] = m.group(2)!;
+    }
+
+    final macToPort = <String, String>{};
+    for (final line in out.split('\n')) {
+      final cols = line.trim().split(RegExp(r'\s+'));
+      if (cols.length >= 4 && cols[1].contains(':') && portMap.containsKey(cols[0])) {
+        macToPort[cols[1].toUpperCase()] = portMap[cols[0]]!;
+      }
+    }
+
+    final found = <DiscoveredSatelliteInfo>[];
+    final arpSection = out.contains('===ARP===') ? out.split('===ARP===')[1].split('===BRMACS===')[0] : '';
+    for (final line in arpSection.split('\n')) {
+      final cols = line.trim().split(RegExp(r'\s+'));
+      if (cols.length >= 6) {
+        final ip = cols[0];
+        final flags = cols[2];
+        final mac = cols[3].toUpperCase();
+        if (ip == mainIp || flags == '0x0' || mac == '00:00:00:00:00:00') continue;
+
+        final isMoto = mac.startsWith('C8:C7:50') || mac.startsWith('00:0C:E7') || mac.startsWith('14:59:C0');
+        final isSatPool = scanIps.contains(ip);
+        final port = macToPort[mac] ?? '';
+        final isWds = port.startsWith('wds');
+
+        if (isMoto || isWds || isSatPool) {
+          // Confirmar que la IP responde realmente a ping para descartar entradas ARP antiguas
+          final aliveCheck = await executeSSH(mainIp, mainPassword, 'ping -c 1 -W 1 $ip >/dev/null 2>&1 && echo "ALIVE" || echo "DEAD"');
+          if (!aliveCheck.contains('ALIVE')) continue;
+
+          String band = port.startsWith('wds1') ? '5 GHz' : '2.4 GHz';
+          String host = '';
+          try {
+            final h = await executeSSHMultiAuth(ip, [mainPassword, ...candidatePasswords], 'cat /proc/sys/kernel/hostname 2>/dev/null');
+            if (h.trim().isNotEmpty) host = h.trim().split('\n').first.trim();
+          } catch (_) {}
+
+          if (!isMoto && !isWds && host.isEmpty) continue;
+          if (host.isEmpty) host = 'Satélite (${ip.split('.').last})';
+
+          if (!found.any((f) => f.ip == ip || (f.mac.isNotEmpty && f.mac == mac))) {
+            found.add(DiscoveredSatelliteInfo(
+              ip: ip,
+              mac: mac,
+              hostname: host,
+              backhaulBand: band,
+            ));
+          }
+        }
+      }
+    }
+    return found;
+  }
+
+  /// Ajusta la potencia de transmisión (Tx Power) en un satélite específico sin derribar el enlace DWDS
+  static Future<void> setSatelliteTxPower(String satIp, String satPassword, int txPower, {List<String> fallbackPasswords = const []}) async {
+    final script = '''
+      if which nvram >/dev/null 2>&1; then
+        nvram set wl0_txpwr='$txPower'
+        nvram set wl1_txpwr='$txPower'
+        nvram commit 2>/dev/null || true
+      fi
+      wl -i wl0 txpwr1 -d $txPower 2>/dev/null || true
+      wl -i wl1 txpwr1 -d $txPower 2>/dev/null || true
       uci -q set wireless.radio0.txpower='$txPower'
       uci -q set wireless.radio1.txpower='$txPower'
-      uci commit wireless
-      (/etc/init.d/network restart) &
-      (sleep 2 && wifi down && sleep 1 && wifi up) &
+      uci commit wireless 2>/dev/null || true
     ''';
-    try {
-      await executeSSH(satIp, satPassword, script);
-    } catch (_) {}
+    await executeSSHMultiAuth(satIp, [satPassword, ...fallbackPasswords], script);
   }
 
   /// Lee configuración actual de DHCP, DNS e IP de LAN
@@ -816,9 +1022,12 @@ class RouterService {
       commands.add("uci set dhcp.lan.start='${cfg.start}'");
       commands.add("uci set dhcp.lan.limit='${cfg.limit}'");
       commands.add("uci commit dhcp");
-      commands.add("uci -q set network.lan.stp='0'");
+      commands.add("uci -q set network.lan.stp='1'");
+      commands.add("uci -q set network.lan.forward_delay='2'");
       commands.add("uci commit network 2>/dev/null || true");
-      commands.add("brctl stp br-lan off 2>/dev/null || true");
+      commands.add("brctl setbridgeprio br-lan 16384 2>/dev/null || true");
+      commands.add("brctl setfd br-lan 2 2>/dev/null || true");
+      commands.add("brctl stp br-lan on 2>/dev/null || true");
       commands.add("/etc/init.d/dnsmasq enable 2>/dev/null || true");
       commands.add("/etc/init.d/dnsmasq restart");
     } else {
@@ -1266,7 +1475,246 @@ class RouterService {
     return '192.168.1.2';
   }
 
-  /// Sincroniza y aprovisiona un satélite conectado por cable (Plug & Mesh)
+  /// Construye el script nativo Broadcom HND DWDS + STP rápido (2s) verificado en hardware real MH7601
+  static String _buildNativeBroadcomDwdsSatelliteScript({
+    required String cleanHost,
+    required String targetIp,
+    required String mainGateway,
+    required String mainSsid,
+    required String mainKey,
+    required bool is24G,
+    String syncRootPassword = '',
+  }) {
+    final cleanMainSsid = mainSsid.replaceAll('Current SSID:', '').replaceAll('"', '').trim();
+    final cleanMainKey = mainKey.replaceAll('"', '').trim();
+    final bhPrimary = is24G ? 'wl0' : 'wl1';
+    final bhVif = is24G ? 'wl0.1' : 'wl1.1';
+    final otherPrimary = is24G ? 'wl1' : 'wl0';
+    final otherVif = is24G ? 'wl1.1' : 'wl0.1';
+
+    return '''
+      # 1. Neutralizar permanentemente servicios Minim/OpenWrt que interfieren con DWDS o cambian la IP
+      for svc in unum minim onboard fix_lan_addr dnsmasq dnsmasq-watchdog firewall rep_dhcpc_mon_launcher mesh_watchdog; do
+        /etc/init.d/\$svc stop 2>/dev/null || true
+        /etc/init.d/\$svc disable 2>/dev/null || true
+      done
+      rm -f /etc/init.d/mesh_watchdog /etc/rc.d/*mesh_watchdog /usr/bin/start_mesh_backhaul.sh 2>/dev/null || true
+      echo '#!/bin/sh' > /usr/bin/unum 2>/dev/null || true
+      echo 'exit 0' >> /usr/bin/unum 2>/dev/null || true
+      chmod 755 /usr/bin/unum 2>/dev/null || true
+      echo '#!/bin/sh' > /sbin/start_on_board_sta.sh 2>/dev/null || true
+      echo 'exit 0' >> /sbin/start_on_board_sta.sh 2>/dev/null || true
+      chmod 755 /sbin/start_on_board_sta.sh 2>/dev/null || true
+      for p in \$(ps | grep -E "start_on_board|mesh_guardian|fix_lan_addr" | grep -v grep | awk '{print \$1}'); do
+        kill -9 "\$p" 2>/dev/null || true
+      done
+      killall -9 unum minim minimd udhcpc 2>/dev/null || true
+      rm -f /tmp/provision_info.json 2>/dev/null || true
+
+      # 2. Sincronizar contraseña root si se indicó
+      ${syncRootPassword.isNotEmpty ? "echo -e '$syncRootPassword\\n$syncRootPassword' | passwd root 2>/dev/null || true" : ""}
+
+      # 3. Habilitar Dropbear SSH (con sshd_enable en U-Boot env) y uhttpd permanentemente
+      /usr/sbin/fw_setenv sshd_enable 1 2>/dev/null || true
+      touch /tmp/sshd_enable
+      uci -q set dropbear.@dropbear[0].enable='1'
+      uci -q delete dropbear.@dropbear[0].Interface
+      uci commit dropbear 2>/dev/null || true
+      /etc/init.d/dropbear enable 2>/dev/null || true
+      /etc/init.d/dropbear restart_admin_enable 2>/dev/null || true
+      /etc/init.d/uhttpd enable 2>/dev/null || true
+      /etc/init.d/uhttpd start 2>/dev/null || true
+
+      # 4. Hostname del Satélite
+      ${cleanHost.isNotEmpty ? "uci set system.@system[0].hostname='$cleanHost'\necho '$cleanHost' > /proc/sys/kernel/hostname\nuci commit system" : ""}
+
+      # 5. Hotplug para interfaces dinámicas WDS
+      mkdir -p /etc/hotplug.d/net
+      cat << 'EOFHP' > /etc/hotplug.d/net/99-wds-bridge
+if echo "\$INTERFACE" | grep -q "^wds"; then
+  ifconfig "\$INTERFACE" up 2>/dev/null || true
+  brctl addif br-lan "\$INTERFACE" 2>/dev/null || true
+fi
+EOFHP
+      chmod +x /etc/hotplug.d/net/99-wds-bridge 2>/dev/null || true
+
+      # 6. Configurar DWDS Nativo Broadcom HND (wlssk + wlconf + libnv2hapdcfg) en NVRAM
+      if which nvram >/dev/null 2>&1; then
+        ${cleanHost.isNotEmpty ? "nvram set router_name='$cleanHost'" : ""}
+        nvram set lan_ifname='br-lan'
+        nvram set lan_ifnames='eth0 eth1 eth2 eth3 eth4 wl0 wl0.1 wl1 wl1.1'
+        nvram set ure_disable='0'
+        nvram set router_disable='1'
+        nvram set multiap_mode='0'
+        nvram unset wl0_wds 2>/dev/null || true
+        nvram unset wl1_wds 2>/dev/null || true
+
+        # Radio primario de retorno ($bhPrimary) = Estación DWDS Nativa Broadcom 4-address
+        nvram set ${bhPrimary}_bss_enabled='1'
+        nvram set ${bhPrimary}_mode='sta'
+        nvram set ${bhPrimary}_dwds='1'
+        nvram set ${bhPrimary}_lazywds='1'
+        nvram set ${bhPrimary}_keep_ap_up='1'
+        nvram set ${bhPrimary}_sta_retry_time='5'
+        nvram set ${bhPrimary}_ssid='$cleanMainSsid'
+        nvram set ${bhPrimary}_akm='psk2'
+        nvram set ${bhPrimary}_crypto='aes'
+        ${cleanMainKey.isNotEmpty ? "nvram set ${bhPrimary}_wpa_psk='$cleanMainKey'" : ""}
+        nvram set ${bhPrimary}_wps_mode='disabled'
+        nvram set ${bhPrimary}_vifs='$bhVif'
+
+        # Interfaz virtual local ($bhVif) = Punto de Acceso Wi-Fi para clientes en la misma banda
+        nvram set ${bhVif}_bss_enabled='1'
+        nvram set ${bhVif}_mode='ap'
+        nvram set ${bhVif}_dwds='1'
+        nvram set ${bhVif}_ssid='$cleanMainSsid'
+        nvram set ${bhVif}_akm='psk2'
+        nvram set ${bhVif}_crypto='aes'
+        ${cleanMainKey.isNotEmpty ? "nvram set ${bhVif}_wpa_psk='$cleanMainKey'" : ""}
+        nvram set ${bhVif}_closed='0'
+        nvram set ${bhVif}_ap_isolate='0'
+        nvram set ${bhVif}_wps_mode='disabled'
+
+        # Otra banda ($otherPrimary) = Punto de Acceso Wi-Fi completo para clientes
+        nvram set ${otherPrimary}_bss_enabled='1'
+        nvram set ${otherPrimary}_mode='ap'
+        nvram set ${otherPrimary}_dwds='1'
+        nvram set ${otherPrimary}_lazywds='1'
+        nvram set ${otherPrimary}_vifs=''
+        nvram set ${otherVif}_bss_enabled='0'
+        nvram set ${otherPrimary}_ssid='$cleanMainSsid'
+        nvram set ${otherPrimary}_akm='psk2'
+        nvram set ${otherPrimary}_crypto='aes'
+        ${cleanMainKey.isNotEmpty ? "nvram set ${otherPrimary}_wpa_psk='$cleanMainKey'" : ""}
+        nvram set ${otherPrimary}_closed='0'
+        nvram set ${otherPrimary}_ap_isolate='0'
+
+        nvram commit 2>/dev/null || true
+      fi
+
+      # 7. Sincronizar UCI wireless para consistencia con diagnósticos
+      uci -q delete wireless.mesh_sta
+      for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
+        ${cleanMainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$cleanMainSsid'" : ""}
+        ${cleanMainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$cleanMainKey'" : ""}
+        uci set wireless.\${iface}.encryption='psk2'
+        uci set wireless.\${iface}.mode='ap'
+        uci set wireless.\${iface}.network='lan'
+        uci set wireless.\${iface}.disabled='0'
+        uci -q delete wireless.\${iface}.wds
+      done
+      uci commit wireless 2>/dev/null || true
+
+      # 8. Modo Puente Universal Capa 2 (eth0 WAN + eth1 LAN en br-lan) con STP rápido (2s) anti-bucles
+      uci -q delete network.wan
+      uci -q delete network.wan6
+      uci -q set network.lan.ifname='eth0 eth1'
+      uci -q set network.lan.type='bridge'
+      uci -q set network.lan.proto='static'
+      ${targetIp.isNotEmpty ? "uci -q set network.lan.ipaddr='$targetIp'" : ""}
+      uci -q set network.lan.netmask='255.255.255.0'
+      uci -q set network.lan.gateway='$mainGateway'
+      uci -q delete network.lan.dns
+      uci add_list network.lan.dns='$mainGateway'
+      uci -q set network.lan.stp='1'
+      uci -q set network.lan.forward_delay='2'
+      uci commit network
+
+      uci set dhcp.lan.ignore='1'
+      uci commit dhcp 2>/dev/null || true
+
+      # 9. Respaldo wpa_supplicant para recuperación automática del guardián
+      cat << 'EOFSUPP' > /etc/mesh_supp.conf
+update_config=1
+ctrl_interface=/var/run/${bhPrimary}_wpa_supplicant
+ctrl_interface_group=0
+network={
+    ssid="$cleanMainSsid"
+    scan_ssid=1
+    proto=RSN
+    key_mgmt=WPA-PSK
+    pairwise=CCMP
+    group=CCMP
+    psk="$cleanMainKey"
+    ieee80211w=0
+}
+EOFSUPP
+      chmod 600 /etc/mesh_supp.conf
+
+      # 10. Guardián Mesh no destructivo (convierte eth0 en puerto switch LAN, configura costos STP y reconecta si cae el AP)
+      cat << 'EOFGUARD' > /usr/bin/mesh_guardian.sh
+#!/bin/sh
+touch /tmp/sshd_enable
+sleep 25
+
+ethswctl -c wan -i eth0 -o disable 2>/dev/null || true
+sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
+
+brctl setbridgeprio br-lan 32768 2>/dev/null || true
+brctl setfd br-lan 2 2>/dev/null || true
+brctl stp br-lan on 2>/dev/null || true
+
+FAIL_COUNT=0
+while true; do
+  for dev in eth0 eth1 $bhPrimary $bhVif $otherPrimary \$(ifconfig -a | grep "^wds" | awk '{print \$1}'); do
+    if ifconfig "\$dev" >/dev/null 2>&1; then
+      ifconfig "\$dev" up 2>/dev/null || true
+      brctl addif br-lan "\$dev" 2>/dev/null || true
+    fi
+  done
+  brctl setpathcost br-lan eth0 4 2>/dev/null || true
+  brctl setpathcost br-lan eth1 4 2>/dev/null || true
+  brctl setpathcost br-lan $bhPrimary 100 2>/dev/null || true
+  brctl setfd br-lan 2 2>/dev/null || true
+  brctl stp br-lan on 2>/dev/null || true
+
+  if ping -c 2 -W 2 $mainGateway >/dev/null 2>&1; then
+    FAIL_COUNT=0
+  else
+    FAIL_COUNT=\$((FAIL_COUNT + 1))
+    if [ "\$FAIL_COUNT" -ge 2 ]; then
+      if ! ps | grep -v grep | grep -q "wpa_supplicant.*$bhPrimary"; then
+        wl -i $bhPrimary dwds 1 2>/dev/null || true
+        wpa_supplicant -i $bhPrimary -Dnl80211 -c /etc/mesh_supp.conf -b br-lan -B >/dev/null 2>&1
+      else
+        wpa_cli -p /var/run/${bhPrimary}_wpa_supplicant -i $bhPrimary scan >/dev/null 2>&1 || true
+        wpa_cli -p /var/run/${bhPrimary}_wpa_supplicant -i $bhPrimary reconnect >/dev/null 2>&1 || true
+      fi
+      FAIL_COUNT=0
+    fi
+  fi
+  sleep 15
+done
+EOFGUARD
+      chmod +x /usr/bin/mesh_guardian.sh
+
+      # 11. Servicio de Inicio Mesh Backhaul (con boot() y start())
+      cat << 'EOFINIT' > /etc/init.d/mesh_backhaul
+#!/bin/sh /etc/rc.common
+START=99
+boot() {
+  start
+}
+start() {
+  touch /tmp/sshd_enable
+  killall mesh_guardian.sh 2>/dev/null || true
+  /usr/bin/mesh_guardian.sh >/dev/null 2>&1 &
+}
+stop() {
+  killall mesh_guardian.sh 2>/dev/null || true
+}
+EOFINIT
+      chmod +x /etc/init.d/mesh_backhaul 2>/dev/null || true
+      /etc/init.d/mesh_backhaul enable 2>/dev/null || true
+
+      sync
+      sync
+      (sleep 2 && reboot -f) >/dev/null 2>&1 &
+    ''';
+  }
+
+  /// Sincroniza y aprovisiona un satélite conectado por cable (Plug & Mesh -> Wireless DWDS listo al desconectar)
   static Future<void> provisionSatelliteOverCable({
     required String tempSatIp,
     required String satPassword,
@@ -1277,6 +1725,7 @@ class RouterService {
     String satName = 'Equipo Satélite',
     int channel5 = 36,
     int channel24 = 6,
+    String backhaulBand = '2.4 GHz',
   }) async {
     final unlocked = await unlockRouter(tempSatIp, satPassword);
     if (!unlocked) {
@@ -1286,197 +1735,91 @@ class RouterService {
 
     final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
     final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
+    final is24G = !backhaulBand.contains('5');
 
-    final script = '''
-      # 1. Neutralizar completamente unum/minim
-      /etc/init.d/unum stop 2>/dev/null || true
-      /etc/init.d/unum disable 2>/dev/null || true
-      /etc/init.d/minim stop 2>/dev/null || true
-      /etc/init.d/minim disable 2>/dev/null || true
-      killall -9 unum 2>/dev/null || true
-      killall -9 minim 2>/dev/null || true
-      echo '#!/bin/sh' > /usr/bin/unum 2>/dev/null || true
-      echo 'exit 0' >> /usr/bin/unum 2>/dev/null || true
-      chmod 755 /usr/bin/unum 2>/dev/null || true
-      rm -f /tmp/provision_info.json 2>/dev/null || true
-
-      # 2. Sincronizar contraseña root para que coincida con el Router Principal
-      ${mainKey.isNotEmpty ? "echo -e '$mainKey\n$mainKey' | passwd root 2>/dev/null || true" : ""}
-
-      # 3. Habilitar Dropbear SSH y uhttpd permanentemente
-      uci -q set dropbear.@dropbear[0].enable='1'
-      uci -q set dropbear.@dropbear[0].Interface='lan'
-      uci commit dropbear 2>/dev/null || true
-      /etc/init.d/dropbear enable 2>/dev/null || true
-      /etc/init.d/dropbear start 2>/dev/null || true
-      /etc/init.d/uhttpd enable 2>/dev/null || true
-      /etc/init.d/uhttpd start 2>/dev/null || true
-      /etc/init.d/firewall stop 2>/dev/null || true
-      /etc/init.d/firewall disable 2>/dev/null || true
-
-      # 2. Hostname del Satélite
-      uci set system.@system[0].hostname='$cleanHost'
-      echo '$cleanHost' > /proc/sys/kernel/hostname
-      uci commit system
-
-      # 3. Canales Wi-Fi
-      uci -q set wireless.radio0.channel='$channel24'
-      uci -q set wireless.radio1.channel='$channel5'
-      uci -q delete wireless.radio0.wds
-      uci -q delete wireless.radio1.wds
-
-      # 4. NVRAM
-      if which nvram >/dev/null 2>&1; then
-        nvram set router_name='$cleanHost'
-        ${mainSsid.isNotEmpty ? "nvram set wl0_ssid='$mainSsid'" : ""}
-        ${mainSsid.isNotEmpty ? "nvram set wl1_ssid='$mainSsid'" : ""}
-        ${mainSsid.isNotEmpty ? "nvram set wl_ssid='$mainSsid'" : ""}
-        ${mainKey.isNotEmpty ? "nvram set wl0_wpa_psk='$mainKey'" : ""}
-        ${mainKey.isNotEmpty ? "nvram set wl1_wpa_psk='$mainKey'" : ""}
-        ${mainKey.isNotEmpty ? "nvram set wl_wpa_psk='$mainKey'" : ""}
-        nvram set wl0_akm='psk2'
-        nvram set wl1_akm='psk2'
-        nvram set wl0_channel='$channel24'
-        nvram set wl1_channel='$channel5'
-        nvram set wl0_lazywds='1'
-        nvram set wl1_lazywds='1'
-        nvram unset wl0_wds 2>/dev/null || true
-        nvram unset wl1_wds 2>/dev/null || true
-        nvram commit 2>/dev/null || true
-      fi
-
-      # 5. Inyección a radios Broadcom
-      wl -i wl0 channel $channel24 2>/dev/null || true
-      wl -i wl1 channel $channel5 2>/dev/null || true
-      ${mainSsid.isNotEmpty ? "wl -i wl0 ssid '$mainSsid' 2>/dev/null || true" : ""}
-      ${mainSsid.isNotEmpty ? "wl -i wl1 ssid '$mainSsid' 2>/dev/null || true" : ""}
-      ${mainKey.isNotEmpty ? "wl -i wl0 wpa_psk '$mainKey' 2>/dev/null || true" : ""}
-      ${mainKey.isNotEmpty ? "wl -i wl1 wpa_psk '$mainKey' 2>/dev/null || true" : ""}
-      wl -i wl0 lazywds 1 2>/dev/null || true
-      wl -i wl1 lazywds 1 2>/dev/null || true
-
-      # 6. Modo Switch Universal: unificar WAN y LAN en br-lan
-      uci -q delete network.wan
-      uci -q delete network.wan6
-      uci -q set network.lan.ifname='eth0 eth1'
-      uci -q set network.lan.type='bridge'
-
-      # 7. Configurar IP fija final y gateway
-      uci set network.lan.ipaddr='$targetIp'
-      uci set network.lan.netmask='255.255.255.0'
-      uci set network.lan.gateway='$mainGateway'
-      uci -q delete network.lan.dns
-      uci add_list network.lan.dns='$mainGateway'
-      uci commit network
-
-      # 8. Apagar DHCP
-      uci set dhcp.lan.ignore='1'
-      uci commit dhcp
-      /etc/init.d/dnsmasq stop 2>/dev/null || true
-      /etc/init.d/dnsmasq disable 2>/dev/null || true
-
-      # 9. Clonar AP Wi-Fi en UCI
-      for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
-        ${mainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$mainSsid'" : ""}
-        ${mainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$mainKey'" : ""}
-        uci set wireless.\${iface}.encryption='psk2'
-        uci set wireless.\${iface}.disabled='0'
-        uci -q delete wireless.\${iface}.wds
-      done
-
-      # 10. Enlace inalámbrico (Backhaul STA en 5 GHz) para cuando se desconecte el cable
-      uci -q delete wireless.mesh_sta
-      uci set wireless.mesh_sta=wifi-iface
-      uci set wireless.mesh_sta.device='radio1'
-      uci set wireless.mesh_sta.mode='sta'
-      uci set wireless.mesh_sta.network='lan'
-      ${mainSsid.isNotEmpty ? "uci set wireless.mesh_sta.ssid='$mainSsid'" : ""}
-      ${mainKey.isNotEmpty ? "uci set wireless.mesh_sta.key='$mainKey'" : ""}
-      uci set wireless.mesh_sta.encryption='psk2'
-      uci commit wireless
-
-      # 11. Script de anexión a bridge
-      mkdir -p /etc/hotplug.d/net
-      cat << 'EOF' > /etc/hotplug.d/net/99-wds-bridge
-      if echo "\$INTERFACE" | grep -qE "wds|wl"; then
-        brctl addif br-lan "\$INTERFACE" 2>/dev/null || true
-      fi
-EOF
-      chmod +x /etc/hotplug.d/net/99-wds-bridge 2>/dev/null || true
-
-      # 12. Watchdog
-      cat << 'EOF' > /etc/init.d/mesh_watchdog
-#!/bin/sh /etc/rc.common
-START=99
-start() {
-  (
-    while true; do
-      sleep 12
-      if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
-        wl -i wl1 wet 1 2>/dev/null || true
-        ${mainKey.isNotEmpty ? "wl -i wl1 join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i wl1 join '$mainSsid' 2>/dev/null || true"}
-        for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
-          brctl addif br-lan "\$dev" 2>/dev/null || true
-        done
-      fi
-    done
-  ) &
-}
-EOF
-      chmod +x /etc/init.d/mesh_watchdog 2>/dev/null || true
-      /etc/init.d/mesh_watchdog enable 2>/dev/null || true
-
-      # 13. Flush y reinicio
-      sync
-      sync
-      (sleep 2 && reboot) &
-    ''';
+    final script = _buildNativeBroadcomDwdsSatelliteScript(
+      cleanHost: cleanHost,
+      targetIp: targetIp,
+      mainGateway: mainGateway,
+      mainSsid: mainSsid,
+      mainKey: mainKey,
+      is24G: is24G,
+      syncRootPassword: mainKey.trim(),
+    );
 
     try {
       await executeSSH(tempSatIp, satPassword, script);
     } catch (_) {}
   }
 
-  /// Aprovisionamiento Guiado Directo del Satélite desde el teléfono
-  /// (Conectado a la red de fábrica en 192.168.1.1)
-  /// Alinea canales con router principal, activa WDS bidireccional, clona NVRAM y unifica br-lan
-  /// Prepara el Router Principal para aceptar conexiones WDS transparentes de satélites
+  /// Prepara el Router Principal para aceptar enlaces inalámbricos DWDS nativos Broadcom de satélites
   static Future<void> prepareMainRouterForWds(String mainIp, String mainPassword) async {
     const script = '''
-      # 1. Hotplug para auto-anexar interfaces wds al puente br-lan
+      # 1. Neutralizar demonio de onboarding que interfiere con interfaces inalámbricas
+      /etc/init.d/onboard stop 2>/dev/null || true
+      /etc/init.d/onboard disable 2>/dev/null || true
+      echo '#!/bin/sh' > /sbin/start_on_board_sta.sh 2>/dev/null || true
+      echo 'exit 0' >> /sbin/start_on_board_sta.sh 2>/dev/null || true
+      chmod 755 /sbin/start_on_board_sta.sh 2>/dev/null || true
+      for p in \$(ps | grep "start_on_board" | grep -v grep | awk '{print \$1}'); do
+        kill -9 "\$p" 2>/dev/null || true
+      done
+      ifconfig wl1.5 down 2>/dev/null || true
+      iw dev wl1.5 del 2>/dev/null || true
+
+      # 2. Habilitar SSH persistente en arranque
+      /usr/sbin/fw_setenv sshd_enable 1 2>/dev/null || true
+      /etc/init.d/dropbear restart_admin_enable 2>/dev/null || true
+
+      # 3. Hotplug para auto-anexar interfaces dinámicas wds0.* / wds1.* al puente br-lan
       mkdir -p /etc/hotplug.d/net
       cat << 'EOF' > /etc/hotplug.d/net/99-wds-bridge
-      if echo "\$INTERFACE" | grep -qE "wds"; then
-        brctl addif br-lan "\$INTERFACE" 2>/dev/null || true
-      fi
+if echo "\$INTERFACE" | grep -q "^wds"; then
+  ifconfig "\$INTERFACE" up 2>/dev/null || true
+  brctl addif br-lan "\$INTERFACE" 2>/dev/null || true
+  brctl setbridgeprio br-lan 16384 2>/dev/null || true
+  brctl setfd br-lan 2 2>/dev/null || true
+  brctl stp br-lan on 2>/dev/null || true
+fi
 EOF
       chmod +x /etc/hotplug.d/net/99-wds-bridge 2>/dev/null || true
 
-      # 2. Habilitar lazywds en radios Broadcom
-      wl -i wl0 lazywds 1 2>/dev/null || true
-      wl -i wl1 lazywds 1 2>/dev/null || true
-
-      # 3. Anexar cualquier interfaz WDS o estación mesh a br-lan
-      for dev in \$(ifconfig -a | grep -E "wds|wl1.5|wl0.5" | awk '{print \$1}'); do
-        brctl addif br-lan "\$dev" 2>/dev/null || true
-      done
-
-      # 4. Asegurar que el puerto LAN (eth1) y DHCP entreguen inmediatamente
+      # 4. Asegurar DHCP activo y puente raíz STP rápido (prioridad 16384, forward_delay 2s)
       uci -q set dhcp.lan.ignore='0'
       uci -q set dhcp.lan.authoritative='1'
       uci -q set dhcp.@dnsmasq[0].authoritative='1'
       uci commit dhcp 2>/dev/null || true
-      uci -q set network.lan.stp='0'
+      uci -q set network.lan.stp='1'
+      uci -q set network.lan.forward_delay='2'
       uci commit network 2>/dev/null || true
-      brctl stp br-lan off 2>/dev/null || true
-      /etc/init.d/dnsmasq restart 2>/dev/null || true
+      brctl setbridgeprio br-lan 16384 2>/dev/null || true
+      brctl setfd br-lan 2 2>/dev/null || true
+      brctl stp br-lan on 2>/dev/null || true
+
+      for dev in \$(ifconfig -a | grep "^wds" | awk '{print \$1}'); do
+        ifconfig "\$dev" up 2>/dev/null || true
+        brctl addif br-lan "\$dev" 2>/dev/null || true
+      done
+
+      # 5. Activar DWDS nativo Broadcom en ambas bandas (reinicia wlssk solo una vez si estaba apagado)
+      DWDS0=\$(wl -i wl0 dwds 2>/dev/null || echo "0")
+      DWDS1=\$(wl -i wl1 dwds 2>/dev/null || echo "0")
+      nvram set wl0_dwds='1'
+      nvram set wl1_dwds='1'
+      nvram set wl0_lazywds='1'
+      nvram set wl1_lazywds='1'
+      nvram commit 2>/dev/null || true
+      if [ "\$DWDS0" != "1" ] || [ "\$DWDS1" != "1" ]; then
+        (sleep 1 && /bin/nvram restart) >/dev/null 2>&1 &
+      fi
     ''';
     try {
       await executeSSH(mainIp, mainPassword, script);
     } catch (_) {}
   }
 
-  /// Alinea canales con router principal, activa WDS bidireccional, clona NVRAM y unifica br-lan
+  /// Aprovisiona el Satélite (conectado en 10.10.11.1 con cable WAN o en 192.168.1.1 por Wi-Fi de fábrica)
+  /// utilizando DWDS Nativo Broadcom HND para operación 100% inalámbrica o híbrida por cable
   static Future<String> provisionSatelliteDirect({
     required String satIp,
     required String satPassword,
@@ -1491,7 +1834,6 @@ EOF
     String backhaulBand = '2.4 GHz',
     void Function(String step, double progress)? onProgress,
   }) async {
-    // 1. Detección automática de IP del satélite (10.10.11.1 si tiene cable conectado, o 192.168.1.1)
     String effectiveSatIp = satIp;
     onProgress?.call('Localizando satélite en la red...', 0.15);
     try {
@@ -1504,9 +1846,9 @@ EOF
     onProgress?.call('Conectando a LuCI en $effectiveSatIp y arrancando SSH...', 0.25);
     final unlocked = await unlockRouter(effectiveSatIp, satPassword);
     if (!unlocked) {
-      throw Exception('No se pudo desbloquear el satélite en $effectiveSatIp. Verifica que tu teléfono esté conectado a la red Wi-Fi de fábrica de ese satélite y que la contraseña de etiqueta sea correcta.');
+      throw Exception('No se pudo desbloquear el satélite en $effectiveSatIp. Verifica que tu teléfono esté conectado al Wi-Fi de ese satélite y que la contraseña de etiqueta sea correcta.');
     }
-    
+
     onProgress?.call('Verificando acceso SSH en puerto 22...', 0.40);
     await Future.delayed(const Duration(seconds: 2));
 
@@ -1519,167 +1861,20 @@ EOF
 
     final cleanName = satName.replaceAll(RegExp(r'[^a-zA-Z0-9_\-\s]'), '').trim();
     final cleanHost = cleanName.replaceAll(RegExp(r'\s+'), '-');
-    final cleanMainSsid = mainSsid.replaceAll('Current SSID:', '').replaceAll('"', '').trim();
-    final cleanMainKey = mainKey.replaceAll('"', '').trim();
+    final is24G = !backhaulBand.contains('5');
+    final bhDesc = is24G ? '2.4 GHz DWDS (Mayor Alcance)' : '5 GHz DWDS (Alta Velocidad)';
 
-    final is24G = backhaulBand.contains('2.4');
-    final bhIface = is24G ? 'wl0.5' : 'wl1.5';
-    final bhPhy = is24G ? 'phy0' : 'phy1';
-    final bhDesc = is24G ? '2.4 GHz (Mayor Alcance)' : '5 GHz (Alta Velocidad)';
+    onProgress?.call('Configurando Broadcom DWDS Nativo ($bhDesc), puente Capa 2 e IP $targetIp...', 0.65);
 
-    onProgress?.call('Configurando Broadcom Mesh Backhaul ($bhIface $bhDesc), puente Capa 2 e IP $targetIp...', 0.65);
-
-    final script = '''
-      # 1. Neutralizar completamente el agente de nube unum/minim
-      /etc/init.d/unum stop 2>/dev/null || true
-      /etc/init.d/unum disable 2>/dev/null || true
-      /etc/init.d/minim stop 2>/dev/null || true
-      /etc/init.d/minim disable 2>/dev/null || true
-      killall -9 unum 2>/dev/null || true
-      killall -9 minim 2>/dev/null || true
-      killall -9 minimd 2>/dev/null || true
-      echo '#!/bin/sh' > /usr/bin/unum 2>/dev/null || true
-      echo 'exit 0' >> /usr/bin/unum 2>/dev/null || true
-      chmod 755 /usr/bin/unum 2>/dev/null || true
-      rm -f /tmp/provision_info.json 2>/dev/null || true
-
-      # 2. Sincronizar contraseña root de fábrica para que coincida con el Router Principal
-      ${mainKey.isNotEmpty ? "echo -e '$mainKey\n$mainKey' | passwd root 2>/dev/null || true" : ""}
-
-      # 3. Habilitar Dropbear SSH y uhttpd permanentemente en satélite
-      uci -q set dropbear.@dropbear[0].enable='1'
-      uci -q set dropbear.@dropbear[0].Interface='lan'
-      uci commit dropbear 2>/dev/null || true
-      /etc/init.d/dropbear enable 2>/dev/null || true
-      /etc/init.d/dropbear start 2>/dev/null || true
-      /etc/init.d/uhttpd enable 2>/dev/null || true
-      /etc/init.d/uhttpd start 2>/dev/null || true
-
-      # 4. Hostname del Satélite y Clonación en NVRAM de Broadcom
-      uci set system.@system[0].hostname='$cleanHost'
-      echo '$cleanHost' > /proc/sys/kernel/hostname
-      uci commit system
-
-      if which nvram >/dev/null 2>&1; then
-        nvram set router_name='$cleanHost'
-        nvram set wl0_ssid='$cleanMainSsid'
-        nvram set wl1_ssid='$cleanMainSsid'
-        nvram set wl_ssid='$cleanMainSsid'
-        ${cleanMainKey.isNotEmpty ? "nvram set wl0_wpa_psk='$cleanMainKey'" : ""}
-        ${cleanMainKey.isNotEmpty ? "nvram set wl1_wpa_psk='$cleanMainKey'" : ""}
-        ${cleanMainKey.isNotEmpty ? "nvram set wl_wpa_psk='$cleanMainKey'" : ""}
-        nvram set wl0_akm='psk2'
-        nvram set wl1_akm='psk2'
-        nvram set wl0_lazywds='1'
-        nvram set wl1_lazywds='1'
-        nvram commit 2>/dev/null || true
-      fi
-      wl -i wl0 ssid '$cleanMainSsid' 2>/dev/null || true
-      wl -i wl1 ssid '$cleanMainSsid' 2>/dev/null || true
-      ${cleanMainKey.isNotEmpty ? "wl -i wl0 wpa_psk '$cleanMainKey' 2>/dev/null || true" : ""}
-      ${cleanMainKey.isNotEmpty ? "wl -i wl1 wpa_psk '$cleanMainKey' 2>/dev/null || true" : ""}
-
-      # 5. Configurar radios como Access Points locales (mismo SSID y clave para Roaming)
-      uci -q delete wireless.mesh_sta
-      for iface in \$(uci show wireless | grep -E "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
-        ${cleanMainSsid.isNotEmpty ? "uci set wireless.\${iface}.ssid='$cleanMainSsid'" : ""}
-        ${cleanMainKey.isNotEmpty ? "uci set wireless.\${iface}.key='$cleanMainKey'" : ""}
-        uci set wireless.\${iface}.encryption='psk2'
-        uci set wireless.\${iface}.mode='ap'
-        uci set wireless.\${iface}.network='lan'
-        uci set wireless.\${iface}.disabled='0'
-      done
-      uci commit wireless
-
-      # 6. Modo Switch Universal: unificar WAN (eth0) y LAN (eth1) en br-lan con IP fija
-      uci -q delete network.wan
-      uci -q delete network.wan6
-      uci -q set network.lan.ifname='eth0 eth1'
-      uci -q set network.lan.type='bridge'
-      uci -q set network.lan.proto='static'
-      uci -q set network.lan.ipaddr='$targetIp'
-      uci -q set network.lan.netmask='255.255.255.0'
-      uci -q set network.lan.gateway='$mainGateway'
-      uci -q delete network.lan.dns
-      uci add_list network.lan.dns='$mainGateway'
-      uci -q set network.lan.stp='0'
-      uci commit network
-
-      # 7. Apagar Servidor DHCP y Firewall local (Puente Capa 2 transparente sin interferencias)
-      uci set dhcp.lan.ignore='1'
-      uci commit dhcp
-      /etc/init.d/dnsmasq stop 2>/dev/null || true
-      /etc/init.d/dnsmasq disable 2>/dev/null || true
-      /etc/init.d/firewall stop 2>/dev/null || true
-      /etc/init.d/firewall disable 2>/dev/null || true
-
-      # 8. Habilitar Reenvío de Paquetes y Bypass de Firewall en Puente
-      sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
-      sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
-
-      # 9. Generar archivo de configuración wpa_supplicant para el enlace Mesh
-      cat << 'EOFSUPP' > /etc/mesh_supp.conf
-update_config=1
-ctrl_interface=/var/run/wpa_supplicant
-network={
-    ssid="$cleanMainSsid"
-    scan_ssid=1
-    proto=RSN
-    key_mgmt=WPA-PSK
-    pairwise=CCMP
-    group=CCMP
-    psk="$cleanMainKey"
-}
-EOFSUPP
-      chmod 600 /etc/mesh_supp.conf
-
-      # 10. Script de arranque de retorno Mesh ($bhIface en $bhPhy)
-      cat << 'EOFSTA' > /usr/bin/start_mesh_backhaul.sh
-#!/bin/sh
-killall -9 wpa_supplicant 2>/dev/null || true
-sleep 1
-ifconfig $bhIface down 2>/dev/null || true
-iw dev $bhIface del 2>/dev/null || true
-sleep 1
-iw phy $bhPhy interface add $bhIface type managed 2>/dev/null || true
-ifconfig $bhIface up 2>/dev/null || true
-wpa_supplicant -i $bhIface -Dnl80211 -c /etc/mesh_supp.conf -b br-lan -B
-sleep 3
-brctl addif br-lan $bhIface 2>/dev/null || true
-EOFSTA
-      chmod +x /usr/bin/start_mesh_backhaul.sh
-
-      # 11. Servicio de Inicio Mesh Backhaul y Dropbear en /etc/init.d
-      cat << 'EOFINIT' > /etc/init.d/mesh_backhaul
-#!/bin/sh /etc/rc.common
-START=95
-start() {
-  /usr/sbin/dropbear -p 22 -B 2>/dev/null || true
-  (
-    sleep 5
-    /usr/bin/start_mesh_backhaul.sh
-    while true; do
-      sleep 12
-      brctl addif br-lan $bhIface 2>/dev/null || true
-      if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
-        /usr/bin/start_mesh_backhaul.sh
-      fi
-    done
-  ) &
-}
-EOFINIT
-      chmod +x /etc/init.d/mesh_backhaul 2>/dev/null || true
-      /etc/init.d/mesh_backhaul enable 2>/dev/null || true
-
-      # 12. Dropbear SSH asegurado en /etc/rc.d
-      /etc/init.d/dropbear enable 2>/dev/null || true
-
-      # 13. Flush y reinicio
-      killall -9 udhcpc 2>/dev/null || true
-      sync
-      sync
-      (sleep 2 && reboot -f) &
-    ''';
+    final script = _buildNativeBroadcomDwdsSatelliteScript(
+      cleanHost: cleanHost,
+      targetIp: targetIp,
+      mainGateway: mainGateway,
+      mainSsid: mainSsid,
+      mainKey: mainKey,
+      is24G: is24G,
+      syncRootPassword: mainKey.trim(),
+    );
 
     try {
       await executeSSH(effectiveSatIp, satPassword, script);
@@ -1694,21 +1889,50 @@ EOFINIT
     return satMac;
   }
 
-  /// Restablece un satélite a sus valores de fábrica de forma remota (Hard Reset)
-  static Future<void> factoryResetSatellite(String ip, String password) async {
+  /// Restablece un satélite a sus valores de fábrica de forma remota (incluyendo restauración de modos AP en NVRAM)
+  static Future<void> factoryResetSatellite(String ip, String password, {List<String> fallbackPasswords = const []}) async {
     const script = '''
-      (sleep 1; firstboot -y 2>/dev/null || jffs2reset -y 2>/dev/null; reboot -f) &
+      if which nvram >/dev/null 2>&1; then
+        nvram set ure_disable='1'
+        nvram set router_disable='0'
+        nvram set multiap_mode='0'
+        nvram set lan_ifnames='eth1 eth2 eth3 eth4 wl0 wl0.1 wl1 wl1.1'
+        nvram set wl0_mode='ap'
+        nvram set wl1_mode='ap'
+        nvram set wl0_dwds='0'
+        nvram set wl1_dwds='0'
+        nvram set wl0_vifs=''
+        nvram set wl1_vifs=''
+        nvram set wl0.1_bss_enabled='0'
+        nvram set wl1.1_bss_enabled='0'
+        nvram commit 2>/dev/null || true
+      fi
+      (sleep 1; firstboot -y 2>/dev/null || jffs2reset -y 2>/dev/null; reboot -f) >/dev/null 2>&1 &
       echo "RESET_INITIATED"
     ''';
     try {
-      await executeSSH(ip, password, script);
+      await executeSSHMultiAuth(ip, [password, ...fallbackPasswords], script);
     } catch (_) {}
   }
 
   /// Restablece el equipo a los valores de fábrica predeterminados (Reset Default)
   static Future<void> factoryReset(String ip, String password) async {
     const script = '''
-      (sleep 1; firstboot -y 2>/dev/null || jffs2reset -y 2>/dev/null; reboot -f) &
+      if which nvram >/dev/null 2>&1; then
+        nvram set ure_disable='1'
+        nvram set router_disable='0'
+        nvram set multiap_mode='0'
+        nvram set wl0_mode='ap'
+        nvram set wl1_mode='ap'
+        nvram set wl0_dwds='0'
+        nvram set wl1_dwds='0'
+        nvram set wl0_vifs=''
+        nvram set wl1_vifs=''
+        nvram set wl0.1_bss_enabled='0'
+        nvram set wl1.1_bss_enabled='0'
+        nvram commit 2>/dev/null || true
+      fi
+      (sleep 1; firstboot -y 2>/dev/null || jffs2reset -y 2>/dev/null; reboot -f) >/dev/null 2>&1 &
       echo "FACTORY_RESET_INITIATED"
     ''';
     await executeSSH(ip, password, script);
@@ -1737,7 +1961,6 @@ EOFINIT
       uci set dhcp.\${sec}.mac='$cleanMac'
       uci set dhcp.\${sec}.ip='$targetIp'
       uci commit dhcp
-      # Limpiar lease dinámico previo para forzar la nueva IP estática de inmediato
       sed -i "/$cleanMac/Id" /tmp/dhcp.leases 2>/dev/null || true
       sed -i "/$cleanMac/Id" /var/dhcp.leases 2>/dev/null || true
       /etc/init.d/dnsmasq restart
@@ -1754,25 +1977,23 @@ EOFINIT
     required String targetIp,
     required String satName,
     String? satMac,
+    List<String> extraPasswords = const [],
   }) async {
     String finalMac = satMac?.trim().toUpperCase() ?? '';
+    final candidatePasswords = [satPassword, mainPassword, ...extraPasswords];
 
-    // Si no tenemos la MAC, obtenerla vía SSH del satélite
     if (finalMac.isEmpty) {
-      for (final p in [satPassword, mainPassword]) {
-        if (p.isEmpty) continue;
-        try {
-          final macOut = await executeSSH(currentSatIp, p, "cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/net/br-lan/address 2>/dev/null || wl -i wl0 cur_etheraddr 2>/dev/null || echo ''");
-          final match = RegExp(r'([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})').firstMatch(macOut);
-          if (match != null) {
-            finalMac = match.group(0)!.toUpperCase();
-            break;
-          }
-        } catch (_) {}
-      }
+      try {
+        final macOut = await executeSSHMultiAuth(
+          currentSatIp,
+          candidatePasswords,
+          "cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/net/br-lan/address 2>/dev/null || wl -i wl0 cur_etheraddr 2>/dev/null || echo ''",
+        );
+        final match = RegExp(r'([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})').firstMatch(macOut);
+        if (match != null) finalMac = match.group(0)!.toUpperCase();
+      } catch (_) {}
     }
 
-    // 1. Agregar reserva estática en el Router Principal
     if (finalMac.isNotEmpty) {
       try {
         await addDhcpStaticReservation(
@@ -1785,7 +2006,6 @@ EOFINIT
       } catch (_) {}
     }
 
-    // 2. Fijar la IP estática directamente en el Satélite
     final script = '''
       uci set network.lan.proto='static'
       uci set network.lan.ipaddr='$targetIp'
@@ -1796,26 +2016,13 @@ EOFINIT
       uci commit network
       killall -9 udhcpc 2>/dev/null || true
       sync
-      (sleep 1 && reboot -f) &
+      (sleep 1 && reboot -f) >/dev/null 2>&1 &
     ''';
 
-    for (final p in [satPassword, mainPassword]) {
-      if (p.isEmpty) continue;
-      try {
-        await executeSSH(currentSatIp, p, script);
-        return;
-      } catch (_) {
-        try {
-          await unlockRouter(currentSatIp, p);
-          await executeSSH(currentSatIp, p, script);
-          return;
-        } catch (_) {}
-      }
-    }
-    throw Exception('No se pudo autenticar en el satélite en $currentSatIp para cambiar la IP.');
+    await executeSSHMultiAuth(currentSatIp, candidatePasswords, script);
   }
 
-  /// Cambia la banda de enlace (Backhaul 2.4 GHz vs 5 GHz) en un satélite activo
+  /// Cambia la banda de enlace DWDS Nativo (Backhaul 2.4 GHz vs 5 GHz) en un satélite activo
   static Future<void> switchSatelliteBackhaulBand({
     required String satIp,
     required String satPassword,
@@ -1823,68 +2030,18 @@ EOFINIT
     required String mainSsid,
     required String mainKey,
     required String targetBand, // '2.4 GHz' o '5 GHz'
+    List<String> fallbackPasswords = const [],
   }) async {
     final is24 = !targetBand.contains('5');
-    final staRadio = is24 ? 'radio0' : 'radio1';
-    final staWl = is24 ? 'wl0' : 'wl1';
+    final script = _buildNativeBroadcomDwdsSatelliteScript(
+      cleanHost: '',
+      targetIp: '',
+      mainGateway: mainGateway,
+      mainSsid: mainSsid,
+      mainKey: mainKey,
+      is24G: is24,
+    );
 
-    final script = '''
-      uci -q delete wireless.mesh_sta
-      uci set wireless.mesh_sta=wifi-iface
-      uci set wireless.mesh_sta.device='$staRadio'
-      uci set wireless.mesh_sta.mode='sta'
-      uci set wireless.mesh_sta.network='lan'
-      ${mainSsid.isNotEmpty ? "uci set wireless.mesh_sta.ssid='$mainSsid'" : ""}
-      ${mainKey.isNotEmpty ? "uci set wireless.mesh_sta.key='$mainKey'" : ""}
-      uci set wireless.mesh_sta.encryption='psk2'
-      uci commit wireless
-
-      cat << 'EOF' > /etc/rc.local
-sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
-sysctl -w net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
-/etc/init.d/firewall stop 2>/dev/null || true
-wl -i $staWl wet 1 2>/dev/null || true
-${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
-for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
-  brctl addif br-lan "\$dev" 2>/dev/null || true
-done
-exit 0
-EOF
-      chmod +x /etc/rc.local 2>/dev/null || true
-
-      cat << 'EOF' > /etc/init.d/mesh_watchdog
-#!/bin/sh /etc/rc.common
-START=99
-start() {
-  (
-    wl -i $staWl wet 1 2>/dev/null || true
-    ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
-    for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
-      brctl addif br-lan "\$dev" 2>/dev/null || true
-    done
-
-    while true; do
-      sleep 12
-      if ! ping -c 1 -W 2 $mainGateway >/dev/null 2>&1; then
-        wl -i $staWl wet 1 2>/dev/null || true
-        ${mainKey.isNotEmpty ? "wl -i $staWl join '$mainSsid' key '$mainKey' amode psk2 2>/dev/null || true" : "wl -i $staWl join '$mainSsid' 2>/dev/null || true"}
-      fi
-      for dev in \$(ifconfig -a | grep -E "wds|wl" | awk '{print \$1}'); do
-        brctl addif br-lan "\$dev" 2>/dev/null || true
-      done
-    done
-  ) &
-}
-EOF
-      chmod +x /etc/init.d/mesh_watchdog 2>/dev/null || true
-      /etc/init.d/mesh_watchdog enable 2>/dev/null || true
-      sync
-      (sleep 2 && reboot) &
-    ''';
-
-    try {
-      await unlockRouter(satIp, satPassword);
-      await executeSSH(satIp, satPassword, script);
-    } catch (_) {}
+    await executeSSHMultiAuth(satIp, [satPassword, ...fallbackPasswords, mainKey], script);
   }
 }
