@@ -828,6 +828,9 @@ EOF
 
     // 1. Verificar si coincide con algún par DWDS en 5 GHz
     final wds1Matches = RegExp(r'WDS1_MAC:([0-9A-Fa-f:]+)\s+RSSI:(-?[0-9]+)').allMatches(output);
+    final wds0Matches = RegExp(r'WDS0_MAC:([0-9A-Fa-f:]+)\s+RSSI:(-?[0-9]+)').allMatches(output);
+
+    // 1. Verificar si coincide con algún par DWDS en 5 GHz
     for (final m in wds1Matches) {
       final wmac = m.group(1)!.toUpperCase();
       final rssi = int.tryParse(m.group(2) ?? '') ?? -55;
@@ -841,7 +844,6 @@ EOF
 
     // 2. Si no es 5 GHz, verificar si coincide con algún par DWDS en 2.4 GHz
     if (!isWireless) {
-      final wds0Matches = RegExp(r'WDS0_MAC:([0-9A-Fa-f:]+)\s+RSSI:(-?[0-9]+)').allMatches(output);
       for (final m in wds0Matches) {
         final wmac = m.group(1)!.toUpperCase();
         final rssi = int.tryParse(m.group(2) ?? '') ?? -55;
