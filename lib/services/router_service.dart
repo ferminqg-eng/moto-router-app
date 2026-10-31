@@ -277,8 +277,8 @@ class RouterService {
   }
 
   /// Ejecuta comando remoto vía SSH
-  static Future<String> executeSSH(String ip, String password, String command) async {
-    final socket = await SSHSocket.connect(ip, 22, timeout: const Duration(seconds: 7));
+  static Future<String> executeSSH(String ip, String password, String command, {Duration timeout = const Duration(seconds: 7)}) async {
+    final socket = await SSHSocket.connect(ip, 22, timeout: timeout);
     final client = SSHClient(
       socket,
       username: 'root',
@@ -295,7 +295,12 @@ class RouterService {
   }
 
   /// Ejecuta comando SSH probando múltiples contraseñas candidatas y desbloqueando SSH si es necesario
-  static Future<String> executeSSHMultiAuth(String ip, List<String> candidatePasswords, String command) async {
+  static Future<String> executeSSHMultiAuth(
+    String ip,
+    List<String> candidatePasswords,
+    String command, {
+    Duration timeout = const Duration(seconds: 4),
+  }) async {
     final passwords = <String>[];
     for (final p in candidatePasswords) {
       final clean = p.trim();
@@ -307,12 +312,12 @@ class RouterService {
     Object? lastErr;
     for (final pass in passwords) {
       try {
-        return await executeSSH(ip, pass, command);
+        return await executeSSH(ip, pass, command, timeout: timeout);
       } catch (e) {
         lastErr = e;
         try {
           await unlockRouter(ip, pass);
-          return await executeSSH(ip, pass, command);
+          return await executeSSH(ip, pass, command, timeout: timeout);
         } catch (e2) {
           lastErr = e2;
         }
@@ -786,7 +791,7 @@ EOF
       done
     ''';
 
-    final output = await executeSSH(mainIp, mainPassword, script);
+    final output = await executeSSH(mainIp, mainPassword, script, timeout: const Duration(seconds: 7));
     if (output.contains('100% packet loss') || output.contains('PING_FAIL')) {
       return SatelliteQuality(
         isOnline: false,
@@ -810,38 +815,57 @@ EOF
       brPort = portMatch.group(1)!.trim();
     }
 
-    String satMacPrefix = '';
+    String satMac = '';
     final macMatch = RegExp(r'===SAT_MAC===([0-9a-f:]+)').firstMatch(output);
-    if (macMatch != null && macMatch.group(1)!.length >= 14) {
-      satMacPrefix = macMatch.group(1)!.substring(0, 14).toUpperCase();
+    if (macMatch != null) {
+      satMac = macMatch.group(1)!.trim().toUpperCase();
     }
+    final satMacPrefix4 = satMac.length >= 11 ? satMac.substring(0, 11) : satMac;
 
     int signal = -55;
-    bool isWireless = brPort.startsWith('wds') || brPort.startsWith('wl');
-    String wirelessBand = brPort.startsWith('wds1') || brPort.startsWith('wl1') ? '5 GHz' : '2.4 GHz';
+    bool isWireless = false;
+    String wirelessBand = '2.4 GHz';
 
-    // Extraer RSSI exacto de la lista DWDS de Broadcom
-    final wds0Matches = RegExp(r'WDS0_MAC:([0-9A-Fa-f:]+)\s+RSSI:(-?[0-9]+)').allMatches(output);
-    for (final m in wds0Matches) {
-      final wmac = m.group(1)!.toUpperCase();
-      final rssi = int.tryParse(m.group(2) ?? '') ?? -55;
-      if (brPort.startsWith('wds0') || (satMacPrefix.isNotEmpty && wmac.startsWith(satMacPrefix))) {
-        signal = rssi;
-        isWireless = true;
-        wirelessBand = '2.4 GHz';
-        break;
-      }
-    }
-
+    // 1. Verificar si coincide con algún par DWDS en 5 GHz
     final wds1Matches = RegExp(r'WDS1_MAC:([0-9A-Fa-f:]+)\s+RSSI:(-?[0-9]+)').allMatches(output);
     for (final m in wds1Matches) {
       final wmac = m.group(1)!.toUpperCase();
       final rssi = int.tryParse(m.group(2) ?? '') ?? -55;
-      if (brPort.startsWith('wds1') || (satMacPrefix.isNotEmpty && wmac.startsWith(satMacPrefix))) {
+      if (satMacPrefix4.isNotEmpty && wmac.startsWith(satMacPrefix4)) {
         signal = rssi;
         isWireless = true;
         wirelessBand = '5 GHz';
         break;
+      }
+    }
+
+    // 2. Si no es 5 GHz, verificar si coincide con algún par DWDS en 2.4 GHz
+    if (!isWireless) {
+      final wds0Matches = RegExp(r'WDS0_MAC:([0-9A-Fa-f:]+)\s+RSSI:(-?[0-9]+)').allMatches(output);
+      for (final m in wds0Matches) {
+        final wmac = m.group(1)!.toUpperCase();
+        final rssi = int.tryParse(m.group(2) ?? '') ?? -55;
+        if (satMacPrefix4.isNotEmpty && wmac.startsWith(satMacPrefix4)) {
+          signal = rssi;
+          isWireless = true;
+          wirelessBand = '2.4 GHz';
+          break;
+        }
+      }
+    }
+
+    // 3. Si no coincidió con el prefijo DWDS pero brPort no es WDS, es Ethernet cableado
+    if (!isWireless) {
+      if (brPort.startsWith('eth') || !brPort.startsWith('wds')) {
+        isWireless = false;
+      } else {
+        // Enlace WDS activo registrado en la interfaz
+        final allWds = [...wds1Matches, ...wds0Matches];
+        if (allWds.isNotEmpty) {
+          signal = int.tryParse(allWds.first.group(2) ?? '') ?? -55;
+          isWireless = true;
+          wirelessBand = wds1Matches.isNotEmpty ? '5 GHz' : '2.4 GHz';
+        }
       }
     }
 
@@ -880,7 +904,13 @@ EOF
     );
   }
 
-  /// Descubre automáticamente satélites activos en la malla (tanto inalámbricos DWDS como cableados en 192.168.1.2-.5)
+  /// Descubre automáticamente satélites activos en la malla (DWDS Inalámbrico y Cable Ethernet)
+  /// Algoritmo estricto 100%:
+  /// 1. Excluye totalmente todas las concesiones DHCP de clientes (teléfonos, tablets, PCs)
+  /// 2. Excluye cualquier IP en el rango DHCP de clientes (último octeto >= 100)
+  /// 3. Filtra por MACs activas en DWDS (wl0/wl1 dwdslist) y pool de infraestructura (.2 a .9)
+  /// 4. Requiere autenticación SSH y verificación del kernel Linux con obtención de hostname real
+  /// 5. NUNCA genera nombres inventados ni satélites falsos si SSH falla
   static Future<List<DiscoveredSatelliteInfo>> discoverActiveMeshSatellites(
     String mainIp,
     String mainPassword, {
@@ -888,38 +918,58 @@ EOF
   }) async {
     final prefixParts = mainIp.split('.');
     final subnetPrefix = prefixParts.length == 4 ? '${prefixParts[0]}.${prefixParts[1]}.${prefixParts[2]}' : '192.168.1';
-    final scanIps = ['$subnetPrefix.2', '$subnetPrefix.3', '$subnetPrefix.4', '$subnetPrefix.5'];
+    final scanIps = ['$subnetPrefix.2', '$subnetPrefix.3', '$subnetPrefix.4', '$subnetPrefix.5', '$subnetPrefix.6', '$subnetPrefix.7', '$subnetPrefix.8', '$subnetPrefix.9'];
     final pingCmd = scanIps.where((ip) => ip != mainIp).map((ip) => 'ping -c 1 -W 1 $ip >/dev/null 2>&1 &').join(' ');
 
     final script = '''
       $pingCmd
       wait
+      echo "===DWDS0==="
+      wl -i wl0 dwdslist 2>/dev/null
+      echo "===DWDS1==="
+      wl -i wl1 dwdslist 2>/dev/null
+      echo "===LEASES==="
+      cat /tmp/dhcp.leases /var/dhcp.leases /var/lib/misc/dnsmasq.leases 2>/dev/null
       echo "===ARP==="
       cat /proc/net/arp 2>/dev/null
-      echo "===BRMACS==="
-      for p in /sys/class/net/br-lan/brif/*; do
-        PNUM=\$(printf "%d" \$(cat "\$p/port_no" 2>/dev/null) 2>/dev/null)
-        echo "PORTMAP:\$PNUM:\$(basename \$p)"
-      done
-      brctl showmacs br-lan 2>/dev/null
     ''';
 
-    final out = await executeSSH(mainIp, mainPassword, script);
-    final portMap = <String, String>{};
-    for (final m in RegExp(r'PORTMAP:(\d+):([^\s\r\n]+)').allMatches(out)) {
-      portMap[m.group(1)!] = m.group(2)!;
-    }
+    final out = await executeSSH(mainIp, mainPassword, script, timeout: const Duration(seconds: 8));
 
-    final macToPort = <String, String>{};
-    for (final line in out.split('\n')) {
-      final cols = line.trim().split(RegExp(r'\s+'));
-      if (cols.length >= 4 && cols[1].contains(':') && portMap.containsKey(cols[0])) {
-        macToPort[cols[1].toUpperCase()] = portMap[cols[0]]!;
+    // 1. Extraer pares DWDS 2.4 GHz y 5 GHz
+    final dwds0Peers = <String>[];
+    final dwds1Peers = <String>[];
+    if (out.contains('===DWDS0===') && out.contains('===DWDS1===')) {
+      final s0 = out.split('===DWDS0===')[1].split('===DWDS1===')[0];
+      for (final m in RegExp(r'([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})').allMatches(s0)) {
+        dwds0Peers.add(m.group(1)!.toUpperCase());
+      }
+    }
+    if (out.contains('===DWDS1===') && out.contains('===LEASES===')) {
+      final s1 = out.split('===DWDS1===')[1].split('===LEASES===')[0];
+      for (final m in RegExp(r'([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})').allMatches(s1)) {
+        dwds1Peers.add(m.group(1)!.toUpperCase());
       }
     }
 
-    final found = <DiscoveredSatelliteInfo>[];
-    final arpSection = out.contains('===ARP===') ? out.split('===ARP===')[1].split('===BRMACS===')[0] : '';
+    // 2. Extraer IPs de clientes DHCP para excluirlas 100%
+    final dhcpLeasedIps = <String>{};
+    if (out.contains('===LEASES===') && out.contains('===ARP===')) {
+      final leasesSection = out.split('===LEASES===')[1].split('===ARP===')[0];
+      for (final line in leasesSection.split('\n')) {
+        final cols = line.trim().split(RegExp(r'\s+'));
+        if (cols.length >= 3) {
+          final ip = cols[2];
+          if (ip.startsWith(subnetPrefix)) {
+            dhcpLeasedIps.add(ip);
+          }
+        }
+      }
+    }
+
+    // 3. Parsear tabla ARP
+    final arpTable = <String, String>{}; // IP -> MAC
+    final arpSection = out.contains('===ARP===') ? out.split('===ARP===')[1] : '';
     for (final line in arpSection.split('\n')) {
       final cols = line.trim().split(RegExp(r'\s+'));
       if (cols.length >= 6) {
@@ -927,38 +977,99 @@ EOF
         final flags = cols[2];
         final mac = cols[3].toUpperCase();
         if (ip == mainIp || flags == '0x0' || mac == '00:00:00:00:00:00') continue;
-
-        final isMoto = mac.startsWith('C8:C7:50') || mac.startsWith('00:0C:E7') || mac.startsWith('14:59:C0');
-        final isSatPool = scanIps.contains(ip);
-        final port = macToPort[mac] ?? '';
-        final isWds = port.startsWith('wds');
-
-        if (isMoto || isWds || isSatPool) {
-          // Confirmar que la IP responde realmente a ping para descartar entradas ARP antiguas
-          final aliveCheck = await executeSSH(mainIp, mainPassword, 'ping -c 1 -W 1 $ip >/dev/null 2>&1 && echo "ALIVE" || echo "DEAD"');
-          if (!aliveCheck.contains('ALIVE')) continue;
-
-          String band = port.startsWith('wds1') ? '5 GHz' : '2.4 GHz';
-          String host = '';
-          try {
-            final h = await executeSSHMultiAuth(ip, [mainPassword, ...candidatePasswords], 'cat /proc/sys/kernel/hostname 2>/dev/null');
-            if (h.trim().isNotEmpty) host = h.trim().split('\n').first.trim();
-          } catch (_) {}
-
-          if (!isMoto && !isWds && host.isEmpty) continue;
-          if (host.isEmpty) host = 'Satélite (${ip.split('.').last})';
-
-          if (!found.any((f) => f.ip == ip || (f.mac.isNotEmpty && f.mac == mac))) {
-            found.add(DiscoveredSatelliteInfo(
-              ip: ip,
-              mac: mac,
-              hostname: host,
-              backhaulBand: band,
-            ));
-          }
-        }
+        arpTable[ip] = mac;
       }
     }
+
+    // 4. Armar lista estricta de candidatos a Satélite
+    final candidateIps = <String>{};
+
+    // Candidatos del pool fijo de infraestructura (.2 a .9)
+    for (final ip in scanIps) {
+      if (ip == mainIp) continue;
+      if (dhcpLeasedIps.contains(ip)) continue;
+      candidateIps.add(ip);
+    }
+
+    // Candidatos de la tabla ARP que coincidan con DWDS o OUI Motorola y NO sean DHCP
+    for (final entry in arpTable.entries) {
+      final ip = entry.key;
+      final mac = entry.value;
+      if (ip == mainIp) continue;
+      if (dhcpLeasedIps.contains(ip)) continue;
+
+      final lastOctet = int.tryParse(ip.split('.').last) ?? 0;
+      if (lastOctet >= 100) continue; // Excluir rango DHCP
+
+      final macPrefix4 = mac.length >= 11 ? mac.substring(0, 11) : mac;
+      final isDwdsMatch = dwds0Peers.any((p) => p.startsWith(macPrefix4)) ||
+                          dwds1Peers.any((p) => p.startsWith(macPrefix4));
+      final isMotoOui = mac.startsWith('C8:C7:50') || mac.startsWith('00:0C:E7') || mac.startsWith('14:59:C0');
+
+      if (isDwdsMatch || isMotoOui) {
+        candidateIps.add(ip);
+      }
+    }
+
+    final found = <DiscoveredSatelliteInfo>[];
+
+    // 5. Verificación estricta de cada candidato mediante Socket y SSH OS Check
+    for (final candIp in candidateIps) {
+      // Chequeo ultra-rápido de puerto 22 cerrado (descarta celulares en 1 ms)
+      bool port22Open = false;
+      try {
+        final sock = await Socket.connect(candIp, 22, timeout: const Duration(milliseconds: 1500));
+        sock.destroy();
+        port22Open = true;
+      } catch (_) {}
+
+      if (!port22Open) continue;
+
+      // Autenticar por SSH y consultar OS y hostname
+      String verifiedHost = '';
+      bool isRouterOs = false;
+      try {
+        final res = await executeSSHMultiAuth(
+          candIp,
+          [mainPassword, ...candidatePasswords],
+          'cat /proc/sys/kernel/hostname 2>/dev/null; uname -s 2>/dev/null',
+          timeout: const Duration(seconds: 4),
+        );
+        final lines = res.split(RegExp(r'[\r\n]+')).map((l) => l.trim()).where((l) => l.isNotEmpty).toList();
+        if (lines.any((l) => l.toLowerCase() == 'linux')) {
+          isRouterOs = true;
+          final hLine = lines.firstWhere((l) => l.toLowerCase() != 'linux', orElse: () => '');
+          if (hLine.isNotEmpty) {
+            verifiedHost = hLine;
+          }
+        }
+      } catch (_) {}
+
+      // SI SSH FALLA O NO ES UN ROUTER LINUX VERIFICADO, SE DESCARTA COMPLETAMENTE
+      if (!isRouterOs || verifiedHost.isEmpty) continue;
+
+      final candMac = arpTable[candIp] ?? '';
+      final candMacPrefix4 = candMac.length >= 11 ? candMac.substring(0, 11) : candMac;
+
+      String band = '2.4 GHz';
+      if (candMacPrefix4.isNotEmpty && dwds1Peers.any((p) => p.startsWith(candMacPrefix4))) {
+        band = '5 GHz';
+      } else if (candMacPrefix4.isNotEmpty && dwds0Peers.any((p) => p.startsWith(candMacPrefix4))) {
+        band = '2.4 GHz';
+      } else {
+        band = '2.4 GHz';
+      }
+
+      if (!found.any((f) => f.ip == candIp || (f.mac.isNotEmpty && candMac.isNotEmpty && f.mac == candMac))) {
+        found.add(DiscoveredSatelliteInfo(
+          ip: candIp,
+          mac: candMac,
+          hostname: verifiedHost,
+          backhaulBand: band,
+        ));
+      }
+    }
+
     return found;
   }
 

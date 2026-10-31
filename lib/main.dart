@@ -183,9 +183,16 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         setState(() {
           _meshNodes.clear();
           for (final item in decoded) {
-            _meshNodes.add(MeshNode.fromJson(item));
+            final node = MeshNode.fromJson(item);
+            // Auto-purga de falsos satélites residuales que fueron clientes DHCP (IP >= 100 y nombre genérico)
+            final lastOctet = int.tryParse(node.ip.split('.').last) ?? 0;
+            if (lastOctet >= 100 && (node.name.startsWith('Satélite (') || node.name == 'Satélite')) {
+              continue; // Purgar cliente DHCP
+            }
+            _meshNodes.add(node);
           }
         });
+        await _persistMeshNodes();
         _calculateNextIp();
       }
     } catch (_) {}
@@ -1443,6 +1450,20 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       _showSnack('Escaneando la malla Mesh (DWDS y LAN) en busca de satélites activos...');
     }
     try {
+      // Purga de seguridad: eliminar de inmediato cualquier nodo residual que sea un cliente DHCP
+      bool purged = false;
+      setState(() {
+        _meshNodes.removeWhere((n) {
+          final octet = int.tryParse(n.ip.split('.').last) ?? 0;
+          final isFake = octet >= 100 && (n.name.startsWith('Satélite (') || n.name == 'Satélite');
+          if (isFake) purged = true;
+          return isFake;
+        });
+      });
+      if (purged) {
+        await _persistMeshNodes();
+      }
+
       final discovered = await RouterService.discoverActiveMeshSatellites(
         _currentIp,
         _currentPassword,
@@ -2919,7 +2940,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                               ),
                             ),
                           ),
-                          if (node.ip != '192.168.1.2') ...[
+                          if (node.ip != '192.168.1.2' && !_meshNodes.any((n) => n != node && n.ip == '192.168.1.2')) ...[
                             const SizedBox(width: 6),
                             InkWell(
                               onTap: () => _fixNodeIpToTarget(node, '192.168.1.2'),
